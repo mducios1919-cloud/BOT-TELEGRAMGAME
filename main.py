@@ -56,6 +56,8 @@ class ZefoyClient:
         self.user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         self.base_url = "https://zefoy.com"
         self.total_sent = 0
+        self.services_ids = {}
+        self.video_key = None
     
     def submit_and_get_services(self, answer):
         try:
@@ -114,7 +116,7 @@ class ZefoyClient:
             return None
     
     def get_services(self):
-        """Lấy danh sách services - DÙNG BEAUTIFULSOUP GIỐNG PYTHON GỐC"""
+        """Lấy danh sách services - Parse giống run.py"""
         try:
             resp = self.session.get(self.base_url, headers={
                 'User-Agent': self.user_agent,
@@ -127,9 +129,12 @@ class ZefoyClient:
             services = []
             service_titles = []
             
-            # Tìm các card service
+            # ===== Tìm tất cả card và form =====
             for card in soup.find_all('div', class_='card'):
-                title_el = card.find(['h5', 'h6', 'div'], class_=['card-title', 'mb-3'])
+                # Lấy title
+                title_el = card.find(['h5', 'h6'], class_=['card-title', 'mb-3'])
+                if not title_el:
+                    title_el = card.find('h5')
                 if not title_el:
                     continue
                 
@@ -143,14 +148,30 @@ class ZefoyClient:
                     status_el = card.find('p', class_='card-text')
                 status = status_el.get_text(strip=True) if status_el else 'Online'
                 
-                # Lấy action URL và input name từ form
+                # Lấy form và action
                 form = card.find('form')
-                action = form.get('action') if form else None
+                action = None
                 input_name = None
+                
                 if form:
+                    action = form.get('action')
                     inp = form.find('input', {'type': 'text'})
                     if inp:
                         input_name = inp.get('name')
+                    else:
+                        # Thử tìm input khác
+                        inp = form.find('input')
+                        if inp and inp.get('name') and 'video' in inp.get('name', '').lower():
+                            input_name = inp.get('name')
+                
+                # Nếu không có form trong card, thử tìm form gần nhất
+                if not action or not input_name:
+                    nearby_form = card.find_next('form')
+                    if nearby_form:
+                        action = nearby_form.get('action')
+                        inp = nearby_form.find('input', {'type': 'text'})
+                        if inp:
+                            input_name = inp.get('name')
                 
                 # Xác định online
                 status_lower = status.lower()
@@ -160,7 +181,13 @@ class ZefoyClient:
                 if 'ago' in status_lower and 'updated' in status_lower:
                     online = True
                 
-                # Lưu vào service_titles để tránh trùng
+                # Lưu vào services_ids để dùng sau
+                if action and input_name:
+                    self.services_ids[title] = action
+                    if not self.video_key:
+                        self.video_key = input_name
+                
+                # Tránh trùng
                 if title not in service_titles:
                     service_titles.append(title)
                     services.append({
@@ -171,7 +198,31 @@ class ZefoyClient:
                         'input_name': input_name
                     })
             
-            # Lọc bỏ fake services
+            # ===== Nếu không tìm thấy, dùng regex =====
+            if len(services) == 0:
+                import re
+                # Tìm form action
+                pattern = r'<form action="([^"]+)"[^>]*>[\s\S]*?<input[^>]*name="([^"]+)"[^>]*placeholder="Enter Video'
+                matches = re.findall(pattern, html)
+                
+                for action, input_name in matches:
+                    # Tìm title gần đó
+                    title_match = re.search(r'<h5[^>]*>([^<]+)</h5>', html[:html.find(action) + len(action)])
+                    title = title_match.group(1).strip() if title_match else 'Unknown'
+                    
+                    if title and title not in service_titles:
+                        service_titles.append(title)
+                        self.services_ids[title] = action
+                        self.video_key = input_name
+                        services.append({
+                            'title': title,
+                            'status': 'Online',
+                            'available': True,
+                            'action': action,
+                            'input_name': input_name
+                        })
+            
+            # ===== Lọc bỏ fake =====
             fake_keywords = ['terms', 'privacy', 'contact', 'policy', 'cookie', 'about']
             real_services = []
             for s in services:
@@ -182,7 +233,7 @@ class ZefoyClient:
             
             print(f"✅ Đã tìm thấy {len(real_services)} services")
             for s in real_services:
-                print(f"   - {s['title']}: {'Online' if s['available'] else 'Offline'}")
+                print(f"   - {s['title']}: action={s['action']}, input={s['input_name']}, {'Online' if s['available'] else 'Offline'}")
             
             return real_services
             
@@ -191,7 +242,6 @@ class ZefoyClient:
             return []
     
     def _parse_timer(self, html):
-        """Lấy timer từ response"""
         if not html:
             return None
         m = re.search(r'remainingTimelogin\s*=\s*(-?\d+)', html)
@@ -205,7 +255,6 @@ class ZefoyClient:
         return None
     
     def _parse_sent_amount(self, html):
-        """Lấy số lượng đã gửi"""
         if not html:
             return None, None, None
         m = re.search(r'Successfully\s+(\d+)\s*([a-zA-Z ]*?)\s*sent\.?', html, re.I)
@@ -220,12 +269,12 @@ class ZefoyClient:
         return None, None, None
     
     def run_service(self, service_title, video_url):
-        """Chạy dịch vụ tăng tương tác"""
+        """Chạy dịch vụ tăng tương tác - Giống run.py"""
         try:
-            # Lấy danh sách services với action
+            # Lấy lại services để có action mới nhất
             services = self.get_services()
             
-            # Tìm service cần chạy
+            # Tìm service
             target = None
             for s in services:
                 if s['title'].lower() == service_title.lower():
@@ -241,7 +290,7 @@ class ZefoyClient:
             if not target['action'] or not target['input_name']:
                 return {'success': False, 'message': f'Không tìm thấy action cho service {service_title}'}
             
-            # Gửi request
+            # Gửi request - giống _post_service trong run.py
             action_url = target['action']
             if not action_url.startswith('http'):
                 action_url = f"{self.base_url}{action_url.lstrip('/')}"
@@ -257,16 +306,14 @@ class ZefoyClient:
             
             response_text = resp.text
             
-            # Kiểm tra kết quả
+            # Kiểm tra kết quả - giống run.py
             if 'Session expired' in response_text:
                 return {'success': False, 'message': '⚠️ Session expired, cần lấy CAPTCHA lại'}
             
-            # Kiểm tra timer
             wait = self._parse_timer(response_text)
             if wait and wait > 0:
                 return {'success': False, 'message': f'⏳ Vui lòng chờ {wait} giây...'}
             
-            # Kiểm tra số lượng đã gửi
             amount, kind, sent_msg = self._parse_sent_amount(response_text)
             if amount is not None:
                 self.total_sent += amount
@@ -275,7 +322,6 @@ class ZefoyClient:
                     'message': f'✅ {sent_msg}  |  Total: {self.total_sent}'
                 }
             
-            # Kiểm tra các thông báo khác
             if 'success' in response_text.lower():
                 return {'success': True, 'message': f'✅ Đã tăng {service_title} thành công!'}
             
@@ -285,12 +331,11 @@ class ZefoyClient:
             if 'service is currently not working' in response_text.lower():
                 return {'success': False, 'message': f'❌ Service {service_title} đang bảo trì'}
             
-            # Thử parse message từ HTML
             m = re.search(r"color:\s*green;?'?[^>]*>\s*([^<]+)", response_text, re.I)
             if m and 'Checking Timer' not in m.group(1):
                 return {'success': True, 'message': f'✅ {m.group(1).strip()}'}
             
-            return {'success': False, 'message': f'❌ Lỗi không xác định: {response_text[:100]}'}
+            return {'success': False, 'message': f'❌ Lỗi: {response_text[:100]}'}
             
         except Exception as e:
             return {'success': False, 'message': str(e)}
@@ -382,7 +427,6 @@ def run_service():
         
         print(f"🔄 Chạy service: {service_title} - Video: {video_url}")
         
-        # Tạo client với session đã có
         client = ZefoyClient()
         if 'cookies' in captcha_cache:
             for name, value in captcha_cache['cookies'].items():
