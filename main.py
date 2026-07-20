@@ -1,9 +1,10 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import base64, hashlib, time, requests, re, os, json, urllib3
+import base64, hashlib, time, re, os, json, urllib3
 from bs4 import BeautifulSoup
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
+import cloudscraper
 
 app = Flask(__name__)
 CORS(app)
@@ -13,11 +14,19 @@ BASE_URL = "https://zefoy.com"
 PASSPHRASE = "43fdda1192dde7f8ffff7161e13580d7"
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-def get_session():
-    """Tạo session với headers giống trình duyệt"""
-    session = requests.Session()
-    session.verify = False
-    session.headers.update({
+def get_scraper():
+    """Tạo cloudscraper session"""
+    scraper = cloudscraper.create_scraper(
+        browser={
+            'browser': 'chrome',
+            'platform': 'windows',
+            'mobile': False
+        },
+        delay=5,
+        interpreter='native'
+    )
+    scraper.verify = False
+    scraper.headers.update({
         'User-Agent': USER_AGENT,
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
         'Accept-Language': 'en-US,en;q=0.9',
@@ -30,11 +39,11 @@ def get_session():
         'Sec-Fetch-User': '?1',
         'Cache-Control': 'max-age=0',
     })
-    return session
+    return scraper
 
 class ZefoyCaptcha:
     def __init__(self):
-        self.session = get_session()
+        self.session = get_scraper()
         self.base_url = BASE_URL
     
     def get(self):
@@ -46,7 +55,14 @@ class ZefoyCaptcha:
             headers={'Accept':'application/json','X-Requested-With':'XMLHttpRequest'},
             timeout=60
         )
-        data = resp.json()
+        
+        # Kiểm tra response có phải JSON không
+        try:
+            data = resp.json()
+        except:
+            print(f"❌ Response không phải JSON: {resp.text[:200]}")
+            raise Exception("Cloudflare đang chặn request")
+        
         md5 = hashlib.md5(USER_AGENT.encode()).hexdigest()
         encoded = data.get(md5) or list(data.values())[0]
         once = base64.b64decode(encoded)
@@ -63,7 +79,7 @@ class ZefoyCaptcha:
 
 class ZefoyClient:
     def __init__(self):
-        self.session = get_session()
+        self.session = get_scraper()
         self.base_url = BASE_URL
         self.total_sent = 0
         self.services_ids = {}
@@ -81,6 +97,7 @@ class ZefoyClient:
             cipher = AES.new(key, AES.MODE_CBC, iv)
             encrypted = cipher.encrypt(pad(json.dumps(fingerprint).encode(), AES.block_size))
             captcha_encoded = json.dumps({'ct':base64.b64encode(encrypted).decode(),'iv':iv.hex(),'s':salt.hex()})
+            
             resp = self.session.post(
                 self.base_url,
                 data={'captchalogin':answer,'captcha_encoded':captcha_encoded},
@@ -93,6 +110,7 @@ class ZefoyClient:
                 timeout=60,
                 allow_redirects=False
             )
+            
             if resp.text.strip().lower() == 'success':
                 return self.get_services()
             return None
