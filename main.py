@@ -56,6 +56,8 @@ class ZefoyClient:
         self.user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         self.base_url = "https://zefoy.com"
         self.total_sent = 0
+        self.cached_services = []  # LƯU SERVICES ĐỂ DÙNG LẠI
+        self.cached_session = None  # LƯU SESSION
     
     def submit_and_get_services(self, answer):
         try:
@@ -107,7 +109,13 @@ class ZefoyClient:
             if body != 'success':
                 return None
             
-            return self.get_services()
+            # Lấy services và LƯU LẠI
+            services = self.get_services()
+            if services:
+                self.cached_services = services
+                self.cached_session = self.session.cookies.get_dict()
+            
+            return services
             
         except Exception as e:
             print(f"Submit error: {e}")
@@ -124,7 +132,6 @@ class ZefoyClient:
             html = resp.text
             soup = BeautifulSoup(html, 'html.parser')
             
-            # ===== DANH SÁCH SERVICE THẬT =====
             REAL_SERVICES = [
                 'Followers', 'Hearts', 'Comments Hearts', 'Views', 
                 'Shares', 'Favorites', 'Live Stream', 'Repost'
@@ -144,7 +151,6 @@ class ZefoyClient:
                 if not title or len(title) < 3:
                     continue
                 
-                # ===== CHỈ LẤY SERVICE THẬT =====
                 is_real = False
                 for real in REAL_SERVICES:
                     if real.lower() in title.lower() or title.lower() in real.lower():
@@ -154,13 +160,11 @@ class ZefoyClient:
                 if not is_real:
                     continue
                 
-                # Lấy status
                 status_el = card.find('small')
                 if not status_el:
                     status_el = card.find('p', class_='card-text')
                 status = status_el.get_text(strip=True) if status_el else 'Online'
                 
-                # Lấy action
                 form = card.find('form')
                 action = None
                 input_name = None
@@ -171,7 +175,6 @@ class ZefoyClient:
                     if inp:
                         input_name = inp.get('name')
                 
-                # Xác định online
                 status_lower = status.lower()
                 online = True
                 if 'soon' in status_lower or 'update' in status_lower or 'offline' in status_lower:
@@ -191,7 +194,7 @@ class ZefoyClient:
             
             print(f"✅ Đã tìm thấy {len(services)} services")
             for s in services:
-                print(f"   - {s['title']}: action={s['action']}, {'Online' if s['available'] else 'Offline'}")
+                print(f"   - {s['title']}: action={s['action']}, input={s['input_name']}, {'Online' if s['available'] else 'Offline'}")
             
             return services
             
@@ -227,8 +230,13 @@ class ZefoyClient:
         return None, None, None
     
     def run_service(self, service_title, video_url):
+        """Chạy dịch vụ - DÙNG SERVICES ĐÃ LƯU, KHÔNG PARSE LẠI"""
         try:
-            services = self.get_services()
+            # ===== DÙNG SERVICES ĐÃ LƯU =====
+            if not self.cached_services:
+                return {'success': False, 'message': 'Chưa có services. Hãy submit CAPTCHA trước!'}
+            
+            services = self.cached_services
             
             target = None
             for s in services:
@@ -245,11 +253,19 @@ class ZefoyClient:
             if not target['action'] or not target['input_name']:
                 return {'success': False, 'message': f'Không tìm thấy action cho service {service_title}'}
             
-            # Gửi request
-            action_url = target['action']
-            if not action_url.startswith('http'):
-                action_url = f"{self.base_url}{action_url.lstrip('/')}"
+            # ===== SỬA URL =====
+            action = target['action']
+            if action.startswith('/'):
+                action_url = self.base_url.rstrip('/') + action
+            elif action.startswith('http'):
+                action_url = action
+            else:
+                action_url = self.base_url.rstrip('/') + '/' + action.lstrip('/')
             
+            print(f"   Action URL: {action_url}")
+            print(f"   Input name: {target['input_name']}")
+            
+            # Gửi request
             data = {target['input_name']: video_url}
             
             resp = self.session.post(action_url, data=data, headers={
@@ -294,8 +310,13 @@ class ZefoyClient:
         except Exception as e:
             return {'success': False, 'message': str(e)}
 
-# ==================== CACHE ====================
-captcha_cache = {}
+# ==================== CACHE TOÀN CỤC ====================
+captcha_cache = {
+    'image': None,
+    'cookies': None,
+    'services': None,    # LƯU SERVICES TOÀN CỤC
+    'session_id': None
+}
 
 # ==================== ROUTES ====================
 @app.route('/')
@@ -337,20 +358,25 @@ def submit_manual():
         print(f"🔄 Submit CAPTCHA: {answer}")
         
         client = ZefoyClient()
-        if 'cookies' in captcha_cache:
+        if captcha_cache.get('cookies'):
             for name, value in captcha_cache['cookies'].items():
                 client.session.cookies.set(name, value)
         
         services = client.submit_and_get_services(answer)
         
         if services is not None and len(services) > 0:
+            # ===== LƯU SERVICES VÀO CACHE TOÀN CỤC =====
+            captcha_cache['services'] = services
+            captcha_cache['session_id'] = client.session.cookies.get('PHPSESSID')
+            captcha_cache['session_cookies'] = client.session.cookies.get_dict()
+            
             online_count = sum(1 for s in services if s['available'])
             return jsonify({
                 'success': True,
                 'message': f'✅ CAPTCHA đúng! Tìm thấy {online_count} dịch vụ online.',
                 'data': {
                     'answer': answer,
-                    'session_id': client.session.cookies.get('PHPSESSID'),
+                    'session_id': captcha_cache['session_id'],
                     'services': services
                 }
             })
@@ -379,12 +405,21 @@ def run_service():
         if not video_url:
             return jsonify({'success': False, 'message': 'Vui lòng nhập link video'})
         
+        # ===== KIỂM TRA CÓ SERVICES TRONG CACHE =====
+        if not captcha_cache.get('services'):
+            return jsonify({'success': False, 'message': 'Chưa có services. Hãy submit CAPTCHA trước!'})
+        
         print(f"🔄 Chạy service: {service_title} - Video: {video_url}")
         
+        # ===== TẠO CLIENT VỚI SESSION ĐÃ LƯU =====
         client = ZefoyClient()
-        if 'cookies' in captcha_cache:
-            for name, value in captcha_cache['cookies'].items():
+        if captcha_cache.get('session_cookies'):
+            for name, value in captcha_cache['session_cookies'].items():
                 client.session.cookies.set(name, value)
+        
+        # ===== GÁN SERVICES ĐÃ LƯU VÀO CLIENT =====
+        client.cached_services = captcha_cache['services']
+        client.cached_session = captcha_cache.get('session_cookies')
         
         result = client.run_service(service_title, video_url)
         return jsonify(result)
