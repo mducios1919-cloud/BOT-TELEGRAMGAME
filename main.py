@@ -7,7 +7,7 @@ import requests
 import re
 import os
 import json
-from bs4 import BeautifulSoup  # THÊM DÒNG NÀY
+from bs4 import BeautifulSoup
 
 app = Flask(__name__)
 CORS(app)
@@ -55,6 +55,7 @@ class ZefoyClient:
         self.session.verify = False
         self.user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         self.base_url = "https://zefoy.com"
+        self.total_sent = 0
     
     def submit_and_get_services(self, answer):
         try:
@@ -125,9 +126,8 @@ class ZefoyClient:
             
             services = []
             service_titles = []
-            service_statuses = []
             
-            # Cách 1: Tìm các card có class card-title và small
+            # Tìm các card service
             for card in soup.find_all('div', class_='card'):
                 title_el = card.find(['h5', 'h6', 'div'], class_=['card-title', 'mb-3'])
                 if not title_el:
@@ -137,12 +137,20 @@ class ZefoyClient:
                 if not title or len(title) < 3:
                     continue
                 
-                # Tìm status
+                # Lấy status
                 status_el = card.find('small')
                 if not status_el:
                     status_el = card.find('p', class_='card-text')
-                
                 status = status_el.get_text(strip=True) if status_el else 'Online'
+                
+                # Lấy action URL và input name từ form
+                form = card.find('form')
+                action = form.get('action') if form else None
+                input_name = None
+                if form:
+                    inp = form.find('input', {'type': 'text'})
+                    if inp:
+                        input_name = inp.get('name')
                 
                 # Xác định online
                 status_lower = status.lower()
@@ -152,48 +160,18 @@ class ZefoyClient:
                 if 'ago' in status_lower and 'updated' in status_lower:
                     online = True
                 
-                # Tránh trùng lặp
+                # Lưu vào service_titles để tránh trùng
                 if title not in service_titles:
                     service_titles.append(title)
-                    service_statuses.append(status)
                     services.append({
                         'title': title,
                         'status': status or 'Online',
-                        'available': online
+                        'available': online,
+                        'action': action,
+                        'input_name': input_name
                     })
             
-            # Cách 2: Nếu không tìm thấy, dùng regex nhưng lọc đúng
-            if len(services) == 0:
-                # Tìm tất cả h5 trong card
-                for h5 in soup.find_all('h5'):
-                    title = h5.get_text(strip=True)
-                    if not title or len(title) < 3:
-                        continue
-                    
-                    # Tìm small gần đó
-                    small = h5.find_next('small')
-                    if not small:
-                        small = h5.parent.find('small') if h5.parent else None
-                    
-                    status = small.get_text(strip=True) if small else 'Online'
-                    
-                    status_lower = status.lower()
-                    online = True
-                    if 'soon' in status_lower or 'update' in status_lower or 'offline' in status_lower:
-                        online = False
-                    if 'ago' in status_lower and 'updated' in status_lower:
-                        online = True
-                    
-                    if title not in service_titles:
-                        service_titles.append(title)
-                        service_statuses.append(status)
-                        services.append({
-                            'title': title,
-                            'status': status or 'Online',
-                            'available': online
-                        })
-            
-            # Lọc bỏ các mục không phải service thật
+            # Lọc bỏ fake services
             fake_keywords = ['terms', 'privacy', 'contact', 'policy', 'cookie', 'about']
             real_services = []
             for s in services:
@@ -211,6 +189,111 @@ class ZefoyClient:
         except Exception as e:
             print(f"Get services error: {e}")
             return []
+    
+    def _parse_timer(self, html):
+        """Lấy timer từ response"""
+        if not html:
+            return None
+        m = re.search(r'remainingTimelogin\s*=\s*(-?\d+)', html)
+        if m:
+            v = int(m.group(1))
+            return v if v > 0 else None
+        m = re.search(r'Please wait\s+(\d+)\s+seconds', html, re.I)
+        if m:
+            v = int(m.group(1))
+            return v if v > 0 else None
+        return None
+    
+    def _parse_sent_amount(self, html):
+        """Lấy số lượng đã gửi"""
+        if not html:
+            return None, None, None
+        m = re.search(r'Successfully\s+(\d+)\s*([a-zA-Z ]*?)\s*sent\.?', html, re.I)
+        if m:
+            amount = int(m.group(1))
+            kind = (m.group(2) or '').strip().lower() or 'items'
+            msg = re.sub(r'\s+', ' ', m.group(0)).strip()
+            return amount, kind, msg
+        m = re.search(r'(\d+)\s*(views?|hearts?|likes?|shares?|followers?|favorites?)\s*sent', html, re.I)
+        if m:
+            return int(m.group(1)), m.group(2).lower(), m.group(0).strip()
+        return None, None, None
+    
+    def run_service(self, service_title, video_url):
+        """Chạy dịch vụ tăng tương tác"""
+        try:
+            # Lấy danh sách services với action
+            services = self.get_services()
+            
+            # Tìm service cần chạy
+            target = None
+            for s in services:
+                if s['title'].lower() == service_title.lower():
+                    target = s
+                    break
+            
+            if not target:
+                return {'success': False, 'message': f'Không tìm thấy service: {service_title}'}
+            
+            if not target['available']:
+                return {'success': False, 'message': f'Service {service_title} đang offline'}
+            
+            if not target['action'] or not target['input_name']:
+                return {'success': False, 'message': f'Không tìm thấy action cho service {service_title}'}
+            
+            # Gửi request
+            action_url = target['action']
+            if not action_url.startswith('http'):
+                action_url = f"{self.base_url}{action_url.lstrip('/')}"
+            
+            data = {target['input_name']: video_url}
+            
+            resp = self.session.post(action_url, data=data, headers={
+                'User-Agent': self.user_agent,
+                'Origin': self.base_url,
+                'Referer': f"{self.base_url}/",
+                'Accept': '*/*',
+            }, timeout=30)
+            
+            response_text = resp.text
+            
+            # Kiểm tra kết quả
+            if 'Session expired' in response_text:
+                return {'success': False, 'message': '⚠️ Session expired, cần lấy CAPTCHA lại'}
+            
+            # Kiểm tra timer
+            wait = self._parse_timer(response_text)
+            if wait and wait > 0:
+                return {'success': False, 'message': f'⏳ Vui lòng chờ {wait} giây...'}
+            
+            # Kiểm tra số lượng đã gửi
+            amount, kind, sent_msg = self._parse_sent_amount(response_text)
+            if amount is not None:
+                self.total_sent += amount
+                return {
+                    'success': True, 
+                    'message': f'✅ {sent_msg}  |  Total: {self.total_sent}'
+                }
+            
+            # Kiểm tra các thông báo khác
+            if 'success' in response_text.lower():
+                return {'success': True, 'message': f'✅ Đã tăng {service_title} thành công!'}
+            
+            if 'Too many requests' in response_text:
+                return {'success': False, 'message': '⚠️ Too many requests, vui lòng chờ...'}
+            
+            if 'service is currently not working' in response_text.lower():
+                return {'success': False, 'message': f'❌ Service {service_title} đang bảo trì'}
+            
+            # Thử parse message từ HTML
+            m = re.search(r"color:\s*green;?'?[^>]*>\s*([^<]+)", response_text, re.I)
+            if m and 'Checking Timer' not in m.group(1):
+                return {'success': True, 'message': f'✅ {m.group(1).strip()}'}
+            
+            return {'success': False, 'message': f'❌ Lỗi không xác định: {response_text[:100]}'}
+            
+        except Exception as e:
+            return {'success': False, 'message': str(e)}
 
 # ==================== CACHE ====================
 captcha_cache = {}
@@ -218,7 +301,7 @@ captcha_cache = {}
 # ==================== ROUTES ====================
 @app.route('/')
 def index():
-    return jsonify({'status': 'ok', 'message': 'Zefoy API Running'})
+    return jsonify({'status': 'ok', 'message': 'Zefoy API Running - Full Version'})
 
 @app.route('/get_captcha')
 def get_captcha():
@@ -279,7 +362,37 @@ def submit_manual():
             })
             
     except Exception as e:
-        print(f"❌ Lỗi: {e}")
+        print(f"❌ Lỗi submit: {e}")
+        return jsonify({'success': False, 'message': str(e)})
+
+@app.route('/run_service', methods=['POST'])
+def run_service():
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({'success': False, 'message': 'Không có dữ liệu'})
+        
+        service_title = data.get('service', '')
+        video_url = data.get('video_url', '')
+        
+        if not service_title:
+            return jsonify({'success': False, 'message': 'Vui lòng chọn dịch vụ'})
+        if not video_url:
+            return jsonify({'success': False, 'message': 'Vui lòng nhập link video'})
+        
+        print(f"🔄 Chạy service: {service_title} - Video: {video_url}")
+        
+        # Tạo client với session đã có
+        client = ZefoyClient()
+        if 'cookies' in captcha_cache:
+            for name, value in captcha_cache['cookies'].items():
+                client.session.cookies.set(name, value)
+        
+        result = client.run_service(service_title, video_url)
+        return jsonify(result)
+        
+    except Exception as e:
+        print(f"❌ Lỗi run_service: {e}")
         return jsonify({'success': False, 'message': str(e)})
 
 @app.route('/health')
