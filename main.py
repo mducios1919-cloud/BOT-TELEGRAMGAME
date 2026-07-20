@@ -61,6 +61,7 @@ class ZefoyClient:
         self.user_agent = USER_AGENT
         self.base_url = BASE_URL
         self.total_sent = 0
+        self.services_cache = {}  # Lưu action và input_name
     
     def submit_captcha(self, answer):
         try:
@@ -167,6 +168,13 @@ class ZefoyClient:
                     if inp:
                         input_name = inp.get('name')
                 
+                # ===== LƯU VÀO CACHE =====
+                if action and input_name:
+                    self.services_cache[title] = {
+                        'action': action,
+                        'input_name': input_name
+                    }
+                
                 status_lower = status.lower()
                 online = True
                 if 'soon' in status_lower or 'update' in status_lower or 'offline' in status_lower:
@@ -220,24 +228,33 @@ class ZefoyClient:
     
     def run_service(self, service_title, video_url):
         try:
-            services = self.get_services()
+            # ===== LẤY ACTION TỪ CACHE =====
+            if service_title in self.services_cache:
+                action = self.services_cache[service_title]['action']
+                input_name = self.services_cache[service_title]['input_name']
+                print(f"📦 Dùng action từ cache: {action}")
+            else:
+                # Fallback: lấy services mới
+                services = self.get_services()
+                target = None
+                for s in services:
+                    if s['title'].lower() == service_title.lower():
+                        target = s
+                        break
+                
+                if not target:
+                    return {'success': False, 'message': f'Không tìm thấy service: {service_title}'}
+                
+                if not target['available']:
+                    return {'success': False, 'message': f'Service {service_title} đang offline'}
+                
+                if not target['action'] or not target['input_name']:
+                    return {'success': False, 'message': f'Không tìm thấy action cho service {service_title}'}
+                
+                action = target['action']
+                input_name = target['input_name']
             
-            target = None
-            for s in services:
-                if s['title'].lower() == service_title.lower():
-                    target = s
-                    break
-            
-            if not target:
-                return {'success': False, 'message': f'Không tìm thấy service: {service_title}'}
-            
-            if not target['available']:
-                return {'success': False, 'message': f'Service {service_title} đang offline'}
-            
-            if not target['action'] or not target['input_name']:
-                return {'success': False, 'message': f'Không tìm thấy action cho service {service_title}'}
-            
-            action = target['action']
+            # ===== GHÉP URL ĐÚNG =====
             if action.startswith('/'):
                 action_url = self.base_url.rstrip('/') + action
             elif action.startswith('http'):
@@ -245,7 +262,11 @@ class ZefoyClient:
             else:
                 action_url = self.base_url.rstrip('/') + '/' + action.lstrip('/')
             
-            data = {target['input_name']: video_url}
+            print(f"   Action URL: {action_url}")
+            print(f"   Input name: {input_name}")
+            
+            # ===== GỬI REQUEST =====
+            data = {input_name: video_url}
             
             resp = self.session.post(action_url, data=data, headers={
                 'User-Agent': self.user_agent,
@@ -293,7 +314,8 @@ class ZefoyClient:
 cache = {
     'cookies': None,
     'services': None,
-    'session_id': None
+    'session_id': None,
+    'services_cache': {}  # Lưu action cho từng service
 }
 
 # ==================== API ROUTES ====================
@@ -354,6 +376,7 @@ def submit():
         if services:
             cache['services'] = services
             cache['session_id'] = client.session.cookies.get('PHPSESSID')
+            cache['services_cache'] = client.services_cache  # Lưu cache action
             
             online = sum(1 for s in services if s['available'])
             return jsonify({
@@ -380,6 +403,7 @@ def get_services():
                     client.session.cookies.set(name, value)
             services = client.get_services()
             cache['services'] = services
+            cache['services_cache'] = client.services_cache
         else:
             services = cache['services']
         
@@ -415,10 +439,16 @@ def run():
             for name, value in cache['cookies'].items():
                 client.session.cookies.set(name, value)
         
+        # ===== GÁN CACHE ACTION VÀO CLIENT =====
+        if cache.get('services_cache'):
+            client.services_cache = cache['services_cache']
+            print(f"📦 Đã load {len(client.services_cache)} actions từ cache")
+        
         result = client.run_service(service_title, video_url)
         return jsonify(result)
         
     except Exception as e:
+        print(f"❌ Lỗi run_service: {e}")
         return jsonify({'success': False, 'message': str(e)})
 
 @app.route('/health')
