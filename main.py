@@ -88,6 +88,7 @@ class ZefoyClient:
         self.s.headers.update({"User-Agent": USER_AGENT})
         self.is_logged_in = False
         self.services = []
+        self.video_key = None  # Lưu input name của video
     
     def _get_captcha(self):
         """Lấy captcha image và token"""
@@ -141,11 +142,23 @@ class ZefoyClient:
         return False
     
     def _load_services(self):
-        """Lấy danh sách services sau khi login"""
+        """Lấy danh sách services và video_key"""
         html = self.s.get(BASE_URL, timeout=30).text
         self.services = []
         soup = BeautifulSoup(html, "html.parser")
         
+        # Tìm video_key từ form
+        video_input = soup.select_one('input[placeholder*="Video"], input[placeholder*="URL"]')
+        if video_input:
+            self.video_key = video_input.get("name")
+        
+        # Nếu không tìm thấy, dùng regex
+        if not self.video_key:
+            m = re.search(r'name="([^"]+)"[^>]*placeholder="Enter Video', html)
+            if m:
+                self.video_key = m.group(1)
+        
+        # Lấy services
         for card in soup.select("div.card"):
             title = card.select_one("h5, h6, .card-title")
             if not title:
@@ -175,7 +188,7 @@ class ZefoyClient:
                 answer = self._ocr(captcha["image"])
                 if answer and len(answer) >= 3:
                     if self._login(answer):
-                        return {"success": True, "answer": answer, "attempt": i+1, "services": self.services}
+                        return {"success": True, "answer": answer, "attempt": i+1}
             except Exception as e:
                 print(f"Attempt {i+1}: {e}")
             time.sleep(2)
@@ -212,9 +225,12 @@ class ZefoyClient:
             return ""
     
     def submit_service(self, link, service_name):
-        """Gửi service"""
+        """Gửi service - SỬA LỖI hoàn toàn"""
         if not self.is_logged_in:
             return {"success": False, "error": "Chưa đăng nhập"}
+        
+        # Reload services để lấy action mới nhất
+        self._load_services()
         
         # Tìm service
         svc = None
@@ -224,36 +240,53 @@ class ZefoyClient:
                 break
         
         if not svc or not svc["action"]:
-            # Thử parse lại
-            self._load_services()
-            for s in self.services:
-                if s["name"].lower() == service_name.lower():
-                    svc = s
-                    break
-        
-        if not svc or not svc["action"]:
             return {"success": False, "error": f"Không tìm thấy service: {service_name}"}
         
-        # Submit
+        # Lấy video_key
+        video_key = self.video_key or svc.get("input_name") or "video_url"
+        
+        # Submit theo đúng format multipart/form-data
         url = svc["action"] if svc["action"].startswith("http") else f"{BASE_URL}{svc['action']}"
         boundary = f"----WebKitFormBoundary{''.join(random.choices(ascii_letters + digits, k=16))}"
-        body = f'--{boundary}\r\nContent-Disposition: form-data; name="{svc["input_name"] or "video_url"}"\r\n\r\n{link}\r\n--{boundary}--\r\n'
+        
+        body_parts = [
+            f'--{boundary}',
+            f'Content-Disposition: form-data; name="{video_key}"',
+            '',
+            link,
+            f'--{boundary}--',
+            ''
+        ]
+        body = '\r\n'.join(body_parts)
         
         resp = self.s.post(url, data=body.encode(), headers={
             "Content-Type": f"multipart/form-data; boundary={boundary}",
             "Origin": BASE_URL,
-            "Referer": BASE_URL + "/"
+            "Referer": BASE_URL + "/",
+            "User-Agent": USER_AGENT
         }, timeout=45)
         
         text = resp.text.strip()
+        
+        # Kiểm tra response
         if text.lower() == "success":
             return {"success": True, "message": "Đã gửi thành công!"}
+        
+        # Giải mã base64 nếu có
         try:
-            decoded = base64.b64decode(text).decode()
+            decoded = base64.b64decode(text).decode('utf-8', errors='ignore')
             if "success" in decoded.lower():
                 return {"success": True, "message": decoded}
+            if "timer" in decoded.lower() or "wait" in decoded.lower():
+                return {"success": False, "message": decoded}
         except:
             pass
+        
+        # Kiểm tra lỗi
+        if "captcha" in text.lower() or "session" in text.lower():
+            self.is_logged_in = False
+            return {"success": False, "error": "Session hết hạn, cần login lại"}
+        
         return {"success": False, "message": text or "Không có phản hồi"}
 
 # ==================== API ====================
@@ -307,12 +340,11 @@ def submit():
         if not link:
             return jsonify({"success": False, "error": "Nhập link video"})
         
-        # Nếu có captcha thì login trước
+        # Nếu có captcha thì login
         if answer:
             if not client._login(answer):
                 return jsonify({"success": False, "error": "Sai captcha"})
         elif not client.is_logged_in:
-            # Auto login
             result = client.auto_login(max_attempts=3)
             if not result["success"]:
                 return jsonify({"success": False, "error": "Không thể đăng nhập"})
@@ -334,7 +366,7 @@ def services():
 def status():
     return jsonify({
         "status": "running",
-        "version": "3.0",
+        "version": "3.1",
         "timestamp": datetime.now().isoformat()
     })
 
@@ -376,7 +408,7 @@ HTML = '''
 <body>
     <nav class="navbar navbar-dark bg-dark border-bottom border-secondary">
         <div class="container">
-            <span class="navbar-brand"><i class="bi bi-rocket-takeoff"></i> Zefoy API v3</span>
+            <span class="navbar-brand"><i class="bi bi-rocket-takeoff"></i> Zefoy API v3.1</span>
             <span id="loginStatus" class="login-status off"><i class="bi bi-circle-fill" style="font-size:8px;"></i> Chưa login</span>
         </div>
     </nav>
@@ -600,6 +632,9 @@ HTML = '''
                     log('✅ ' + (data.message || 'Thành công!'), 'success');
                 } else {
                     log('❌ ' + (data.error || data.message || 'Thất bại'), 'error');
+                    if (data.error && data.error.includes('login')) {
+                        updateStatus(false);
+                    }
                 }
             } catch(e) { log('❌ ' + e.message, 'error'); }
             finally {
@@ -620,7 +655,7 @@ HTML = '''
 
         // Init
         refreshCaptcha();
-        log('🚀 Zefoy API v3 đã sẵn sàng', 'success');
+        log('🚀 Zefoy API v3.1 đã sẵn sàng', 'success');
         log('💡 Login → Chọn service → Gửi', 'info');
     </script>
 </body>
@@ -634,7 +669,7 @@ def index():
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     print("=" * 50)
-    print("🚀 ZEFOY API v3")
+    print("🚀 ZEFOY API v3.1")
     print("=" * 50)
     print(f"📍 Port: {port}")
     print("=" * 50)
