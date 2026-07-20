@@ -1,34 +1,54 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import base64, hashlib, time, requests, re, os, json, urllib3
+import base64, hashlib, time, re, os, json, urllib3
 from bs4 import BeautifulSoup
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 
+# ===== DÙNG CLOUDSCRAPER THAY REQUESTS =====
+import cloudscraper
+
 app = Flask(__name__)
 CORS(app)
 
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 BASE_URL = "https://zefoy.com"
 PASSPHRASE = "43fdda1192dde7f8ffff7161e13580d7"
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 class ZefoyCaptcha:
     def __init__(self):
-        self.session = requests.Session()
+        # ===== TẠO SESSION BẰNG CLOUDSCRAPER =====
+        self.session = cloudscraper.create_scraper(
+            browser={
+                'browser': 'chrome',
+                'platform': 'windows',
+                'mobile': False
+            },
+            delay=5
+        )
         self.session.verify = False
         self.user_agent = USER_AGENT
         self.base_url = BASE_URL
+    
     def get(self):
-        self.session.get(self.base_url, timeout=30)
+        self.session.get(self.base_url, timeout=60)
         ts = int(time.time())
-        resp = self.session.get(f"{self.base_url}/?getcapthca={ts}", headers={'Accept':'application/json','X-Requested-With':'XMLHttpRequest','User-Agent':self.user_agent}, timeout=30)
+        resp = self.session.get(
+            f"{self.base_url}/?getcapthca={ts}",
+            headers={'Accept':'application/json','X-Requested-With':'XMLHttpRequest','User-Agent':self.user_agent},
+            timeout=60
+        )
         data = resp.json()
         md5 = hashlib.md5(self.user_agent.encode()).hexdigest()
         encoded = data.get(md5) or list(data.values())[0]
         once = base64.b64decode(encoded)
         path = base64.b64decode(once).decode().strip()
-        img_resp = self.session.get(f"{self.base_url}/{path.lstrip('/')}", headers={'User-Agent':self.user_agent}, timeout=30)
+        img_resp = self.session.get(
+            f"{self.base_url}/{path.lstrip('/')}",
+            headers={'User-Agent':self.user_agent},
+            timeout=60
+        )
         class R: pass
         r = R()
         r.image_bytes = img_resp.content
@@ -37,13 +57,21 @@ class ZefoyCaptcha:
 
 class ZefoyClient:
     def __init__(self):
-        self.session = requests.Session()
+        # ===== TẠO SESSION BẰNG CLOUDSCRAPER =====
+        self.session = cloudscraper.create_scraper(
+            browser={
+                'browser': 'chrome',
+                'platform': 'windows',
+                'mobile': False
+            },
+            delay=5
+        )
         self.session.verify = False
         self.user_agent = USER_AGENT
         self.base_url = BASE_URL
         self.total_sent = 0
-        self.services_ids = {}   # Lưu action theo tên service
-        self.services_input = {} # Lưu input_name theo tên service
+        self.services_ids = {}
+        self.services_input = {}
     
     def submit_captcha(self, answer):
         try:
@@ -57,16 +85,33 @@ class ZefoyClient:
             cipher = AES.new(key, AES.MODE_CBC, iv)
             encrypted = cipher.encrypt(pad(json.dumps(fingerprint).encode(), AES.block_size))
             captcha_encoded = json.dumps({'ct':base64.b64encode(encrypted).decode(),'iv':iv.hex(),'s':salt.hex()})
-            resp = self.session.post(self.base_url, data={'captchalogin':answer,'captcha_encoded':captcha_encoded}, headers={'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8','X-Requested-With':'XMLHttpRequest','User-Agent':self.user_agent,'Origin':self.base_url,'Referer':f"{self.base_url}/"}, timeout=30, allow_redirects=False)
+            resp = self.session.post(
+                self.base_url,
+                data={'captchalogin':answer,'captcha_encoded':captcha_encoded},
+                headers={
+                    'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8',
+                    'X-Requested-With':'XMLHttpRequest',
+                    'User-Agent':self.user_agent,
+                    'Origin':self.base_url,
+                    'Referer':f"{self.base_url}/"
+                },
+                timeout=60,
+                allow_redirects=False
+            )
             if resp.text.strip().lower() == 'success':
                 return self.get_services()
             return None
         except Exception as e:
+            print(f"Submit error: {e}")
             return None
     
     def get_services(self):
         try:
-            resp = self.session.get(self.base_url, headers={'User-Agent':self.user_agent,'Referer':f"{self.base_url}/"}, timeout=30)
+            resp = self.session.get(
+                self.base_url,
+                headers={'User-Agent':self.user_agent,'Referer':f"{self.base_url}/"},
+                timeout=60
+            )
             soup = BeautifulSoup(resp.text, 'html.parser')
             REAL = ['Followers','Hearts','Comments Hearts','Views','Shares','Favorites','Live Stream','Repost']
             services = []
@@ -77,7 +122,6 @@ class ZefoyClient:
                 title = title_el.get_text(strip=True)
                 if not title or len(title) < 3: continue
                 
-                # Chỉ lấy service thật
                 is_real = False
                 for r in REAL:
                     if r.lower() in title.lower() or title.lower() in r.lower():
@@ -88,7 +132,6 @@ class ZefoyClient:
                 status_el = card.find('small') or card.find('p', class_='card-text')
                 status = status_el.get_text(strip=True) if status_el else 'Online'
                 
-                # Lấy form và action
                 form = card.find('form')
                 action = None
                 input_name = None
@@ -97,20 +140,17 @@ class ZefoyClient:
                     inp = form.find('input', {'type':'text'})
                     if inp:
                         input_name = inp.get('name')
-                    # Nếu không tìm thấy input text, thử input khác
                     if not input_name:
                         for inp in form.find_all('input'):
                             if inp.get('type') != 'hidden' and inp.get('name'):
                                 input_name = inp.get('name')
                                 break
                 
-                # ==== LƯU ACTION VÀ INPUT_NAME ====
                 if action:
                     self.services_ids[title] = action
                 if input_name:
                     self.services_input[title] = input_name
                 
-                # Xác định online
                 online = True
                 if 'soon' in status.lower() or 'update' in status.lower() or 'offline' in status.lower():
                     online = False
@@ -125,11 +165,7 @@ class ZefoyClient:
                     'input_name': input_name
                 })
             
-            # In ra log để debug
             print(f"✅ Đã tìm thấy {len(services)} services")
-            for s in services:
-                print(f"   - {s['title']}: action={s['action']}, input={s['input_name']}, online={s['available']}")
-            
             return services
             
         except Exception as e:
@@ -155,28 +191,23 @@ class ZefoyClient:
     
     def run_service(self, service_title, video_url):
         try:
-            # ===== LẤY ACTION TỪ CACHE =====
             action = self.services_ids.get(service_title)
             input_name = self.services_input.get(service_title)
             
-            # Nếu không có trong cache, thử lấy lại services
             if not action:
-                print(f"⚠️ Không tìm thấy action cho {service_title} trong cache, đang lấy lại...")
+                print(f"⚠️ Không tìm thấy action cho {service_title}")
                 services = self.get_services()
                 for s in services:
                     if s['title'] == service_title:
                         action = s.get('action')
                         input_name = s.get('input_name')
-                        if action:
-                            self.services_ids[service_title] = action
-                        if input_name:
-                            self.services_input[service_title] = input_name
+                        if action: self.services_ids[service_title] = action
+                        if input_name: self.services_input[service_title] = input_name
                         break
             
             if not action:
                 return {'success': False, 'message': f'❌ Không tìm thấy action cho {service_title}'}
             
-            # ===== GHÉP URL =====
             if action.startswith('/'):
                 action_url = self.base_url.rstrip('/') + action
             elif action.startswith('http'):
@@ -190,14 +221,18 @@ class ZefoyClient:
             print(f"   Action URL: {action_url}")
             print(f"   Input name: {input_name}")
             
-            # ===== GỬI REQUEST =====
             data = {input_name: video_url}
-            resp = self.session.post(action_url, data=data, headers={
-                'User-Agent': self.user_agent,
-                'Origin': self.base_url,
-                'Referer': f"{self.base_url}/",
-                'Accept': '*/*',
-            }, timeout=30)
+            resp = self.session.post(
+                action_url,
+                data=data,
+                headers={
+                    'User-Agent': self.user_agent,
+                    'Origin': self.base_url,
+                    'Referer': f"{self.base_url}/",
+                    'Accept': '*/*',
+                },
+                timeout=60
+            )
             
             text = resp.text
             
@@ -228,19 +263,19 @@ class ZefoyClient:
         except Exception as e:
             return {'success': False, 'message': str(e)}
 
-# ==================== CACHE TOÀN CỤC ====================
+# ===== CACHE =====
 cache = {
     'cookies': None,
     'services': None,
     'session_id': None,
-    'services_ids': {},    # Lưu action
-    'services_input': {}   # Lưu input_name
+    'services_ids': {},
+    'services_input': {}
 }
 
-# ==================== API ====================
+# ===== API =====
 @app.route('/')
 def index():
-    return jsonify({'status':'ok','message':'Zefoy API v2.0'})
+    return jsonify({'status':'ok','message':'Zefoy API v2.0 - Cloudscraper'})
 
 @app.route('/get_captcha')
 def get_captcha():
@@ -279,14 +314,13 @@ def submit():
         services = client.submit_captcha(answer)
         
         if services:
-            # ===== LƯU TẤT CẢ VÀO CACHE =====
             cache['services'] = services
             cache['session_id'] = client.session.cookies.get('PHPSESSID')
             cache['services_ids'] = client.services_ids
             cache['services_input'] = client.services_input
             
             online = sum(1 for s in services if s['available'])
-            print(f"✅ Lưu cache: {len(cache['services_ids'])} actions, {len(cache['services_input'])} inputs")
+            print(f"✅ Lưu cache: {len(cache['services_ids'])} actions")
             
             return jsonify({
                 'success': True,
@@ -324,7 +358,6 @@ def run():
             for name, value in cache['cookies'].items():
                 client.session.cookies.set(name, value)
         
-        # ===== GÁN CACHE VÀO CLIENT =====
         client.services_ids = cache.get('services_ids', {})
         client.services_input = cache.get('services_input', {})
         
