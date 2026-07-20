@@ -1,12 +1,9 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import base64, hashlib, time, re, os, json, urllib3
+import base64, hashlib, time, requests, re, os, json, urllib3
 from bs4 import BeautifulSoup
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
-
-# ===== DÙNG CLOUDSCRAPER THAY REQUESTS =====
-import cloudscraper
 
 app = Flask(__name__)
 CORS(app)
@@ -16,37 +13,46 @@ BASE_URL = "https://zefoy.com"
 PASSPHRASE = "43fdda1192dde7f8ffff7161e13580d7"
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+def get_session():
+    """Tạo session với headers giống trình duyệt"""
+    session = requests.Session()
+    session.verify = False
+    session.headers.update({
+        'User-Agent': USER_AGENT,
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'none',
+        'Sec-Fetch-User': '?1',
+        'Cache-Control': 'max-age=0',
+    })
+    return session
+
 class ZefoyCaptcha:
     def __init__(self):
-        # ===== TẠO SESSION BẰNG CLOUDSCRAPER =====
-        self.session = cloudscraper.create_scraper(
-            browser={
-                'browser': 'chrome',
-                'platform': 'windows',
-                'mobile': False
-            },
-            delay=5
-        )
-        self.session.verify = False
-        self.user_agent = USER_AGENT
+        self.session = get_session()
         self.base_url = BASE_URL
     
     def get(self):
+        # Lấy session cookie
         self.session.get(self.base_url, timeout=60)
         ts = int(time.time())
         resp = self.session.get(
             f"{self.base_url}/?getcapthca={ts}",
-            headers={'Accept':'application/json','X-Requested-With':'XMLHttpRequest','User-Agent':self.user_agent},
+            headers={'Accept':'application/json','X-Requested-With':'XMLHttpRequest'},
             timeout=60
         )
         data = resp.json()
-        md5 = hashlib.md5(self.user_agent.encode()).hexdigest()
+        md5 = hashlib.md5(USER_AGENT.encode()).hexdigest()
         encoded = data.get(md5) or list(data.values())[0]
         once = base64.b64decode(encoded)
         path = base64.b64decode(once).decode().strip()
         img_resp = self.session.get(
             f"{self.base_url}/{path.lstrip('/')}",
-            headers={'User-Agent':self.user_agent},
             timeout=60
         )
         class R: pass
@@ -57,17 +63,7 @@ class ZefoyCaptcha:
 
 class ZefoyClient:
     def __init__(self):
-        # ===== TẠO SESSION BẰNG CLOUDSCRAPER =====
-        self.session = cloudscraper.create_scraper(
-            browser={
-                'browser': 'chrome',
-                'platform': 'windows',
-                'mobile': False
-            },
-            delay=5
-        )
-        self.session.verify = False
-        self.user_agent = USER_AGENT
+        self.session = get_session()
         self.base_url = BASE_URL
         self.total_sent = 0
         self.services_ids = {}
@@ -75,7 +71,7 @@ class ZefoyClient:
     
     def submit_captcha(self, answer):
         try:
-            fingerprint = {'deviceInfo':{'cpuCores':8,'platform':'Win32'},'browserInfo':{'userAgent':self.user_agent,'language':'en'},'screenInfo':{'width':1920,'height':1080}}
+            fingerprint = {'deviceInfo':{'cpuCores':8,'platform':'Win32'},'browserInfo':{'userAgent':USER_AGENT,'language':'en'},'screenInfo':{'width':1920,'height':1080}}
             salt = os.urandom(8)
             derived = b''; block = b''
             while len(derived) < 48:
@@ -91,7 +87,6 @@ class ZefoyClient:
                 headers={
                     'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8',
                     'X-Requested-With':'XMLHttpRequest',
-                    'User-Agent':self.user_agent,
                     'Origin':self.base_url,
                     'Referer':f"{self.base_url}/"
                 },
@@ -107,11 +102,7 @@ class ZefoyClient:
     
     def get_services(self):
         try:
-            resp = self.session.get(
-                self.base_url,
-                headers={'User-Agent':self.user_agent,'Referer':f"{self.base_url}/"},
-                timeout=60
-            )
+            resp = self.session.get(self.base_url, timeout=60)
             soup = BeautifulSoup(resp.text, 'html.parser')
             REAL = ['Followers','Hearts','Comments Hearts','Views','Shares','Favorites','Live Stream','Repost']
             services = []
@@ -226,7 +217,6 @@ class ZefoyClient:
                 action_url,
                 data=data,
                 headers={
-                    'User-Agent': self.user_agent,
                     'Origin': self.base_url,
                     'Referer': f"{self.base_url}/",
                     'Accept': '*/*',
@@ -275,7 +265,7 @@ cache = {
 # ===== API =====
 @app.route('/')
 def index():
-    return jsonify({'status':'ok','message':'Zefoy API v2.0 - Cloudscraper'})
+    return jsonify({'status':'ok','message':'Zefoy API v2.0'})
 
 @app.route('/get_captcha')
 def get_captcha():
