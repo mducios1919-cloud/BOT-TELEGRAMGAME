@@ -6,12 +6,10 @@ import base64
 import hashlib
 import re
 import random
-import threading
 from datetime import datetime
-from pathlib import Path
-from typing import Optional, Dict, Any, List
+from typing import Optional
 from string import ascii_letters, digits
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse
 
 # ==================== CÀI ĐẶT DEPENDENCIES ====================
 try:
@@ -20,21 +18,15 @@ except ImportError:
     os.system("pip install flask flask-cors requests beautifulsoup4 pycryptodome gunicorn")
 
 # ==================== FLASK APP ====================
-from flask import Flask, request, jsonify, render_template_string, session, redirect, url_for
+from flask import Flask, request, jsonify, render_template_string
 from flask_cors import CORS
-from werkzeug.security import generate_password_hash, check_password_hash
 import requests
 from bs4 import BeautifulSoup
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
 
 app = Flask(__name__)
-app.secret_key = os.environ.get('SECRET_KEY', 'zefoy-secret-key-2026')
 CORS(app)
-
-ADMIN_USERNAME = os.environ.get('ADMIN_USERNAME', 'admin')
-ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD', 'zefoy2026')
-ADMIN_PASSWORD_HASH = generate_password_hash(ADMIN_PASSWORD)
 
 # ==================== CONSTANTS ====================
 DEFAULT_BASE_URL = "https://zefoy.com"
@@ -230,7 +222,7 @@ def solve_captcha(image_bytes):
         print(f"OCR error: {e}")
         return ""
 
-# ==================== ZEFOY CLIENT (SỬA LẠI) ====================
+# ==================== ZEFOY CLIENT ====================
 class ZefoyClient:
     def __init__(self):
         self.session = requests.Session()
@@ -265,11 +257,9 @@ class ZefoyClient:
         xhr_ok = resp.status_code == 200 and xhr_body.lower() == "success"
         
         if xhr_ok:
-            # GET lại trang để lấy services
             follow = self.session.get(self.base_url, timeout=30)
             html = follow.text
             self.is_logged_in = True
-            # Lấy services ngay sau khi login
             self.services_cache = self._parse_services(html)
             return {"success": True, "html": html, "services": self.services_cache}
         
@@ -333,10 +323,8 @@ class ZefoyClient:
         if not self.is_logged_in:
             return {"success": False, "error": "Chưa đăng nhập. Vui lòng giải captcha trước"}
         
-        # Lấy services mới nhất
         services = self.get_services()
         
-        # Tìm service
         service_action = None
         service_input = None
         
@@ -347,7 +335,6 @@ class ZefoyClient:
                 break
         
         if not service_action:
-            # Fallback: tìm bằng regex
             html = self.session.get(self.base_url, timeout=30).text
             for m in re.finditer(r'<form action="([^"]+)"[^>]*>[\s\S]*?name="([^"]+)"[^>]*placeholder="Enter Video', html, re.I):
                 prev = html[max(0, m.start() - 400):m.start()]
@@ -361,7 +348,6 @@ class ZefoyClient:
         if not service_action:
             return {"success": False, "error": f"Service '{service_name}' not found"}
         
-        # Submit
         url = service_action if service_action.startswith("http") else f"{self.base_url}{service_action}"
         token = "".join(random.choices(ascii_letters + digits, k=16))
         boundary = f'----WebKitFormBoundary{token}'
@@ -418,8 +404,10 @@ class ZefoyClient:
         return {"success": False, "error": "Max attempts reached"}
 
 # ==================== API ENDPOINTS ====================
+
 @app.route('/api/captcha', methods=['GET'])
 def api_get_captcha():
+    """Lấy captcha mới"""
     try:
         client = ZefoyClient()
         captcha = client.get_captcha()
@@ -499,18 +487,15 @@ def api_submit():
         
         client = ZefoyClient()
         
-        # Nếu có captcha thì login trước
         if answer:
             login_result = client.login(answer)
             if not login_result["success"]:
                 return jsonify({'success': False, 'error': login_result.get('error', 'Đăng nhập thất bại')}), 400
         else:
-            # Auto login
             login_result = client.solve_and_login(max_attempts=3)
             if not login_result.get("success"):
                 return jsonify({'success': False, 'error': login_result.get('error', 'Không thể đăng nhập')}), 400
         
-        # Submit service
         result = client.submit_service(link, service)
         
         if result.get('success'):
@@ -525,7 +510,6 @@ def api_services():
     """Lấy danh sách services (phải login trước)"""
     try:
         client = ZefoyClient()
-        # Login tự động nếu chưa login
         if not client.is_logged_in:
             login_result = client.solve_and_login(max_attempts=2)
             if not login_result.get("success"):
@@ -538,47 +522,22 @@ def api_services():
 
 @app.route('/api/status', methods=['GET'])
 def api_status():
+    """Kiểm tra trạng thái API"""
     return jsonify({
         'status': 'running',
         'version': '2.1',
         'timestamp': datetime.now().isoformat(),
         'endpoints': [
-            '/api/captcha', '/api/login', '/api/solve', 
-            '/api/submit', '/api/services', '/api/status'
+            'GET  /api/captcha  - Lấy captcha',
+            'POST /api/login    - Login bằng captcha',
+            'POST /api/solve    - Auto login (OCR)',
+            'POST /api/submit   - Gửi service',
+            'GET  /api/services - Danh sách service',
+            'GET  /api/status   - Trạng thái'
         ]
     })
 
-# ==================== ADMIN ====================
-def require_admin(f):
-    def decorated(*args, **kwargs):
-        if not session.get('admin_logged_in'):
-            return redirect(url_for('admin_login'))
-        return f(*args, **kwargs)
-    decorated.__name__ = f.__name__
-    return decorated
-
-@app.route('/admin/login', methods=['GET', 'POST'])
-def admin_login():
-    if request.method == 'POST':
-        username = request.form.get('username', '')
-        password = request.form.get('password', '')
-        if username == ADMIN_USERNAME and check_password_hash(ADMIN_PASSWORD_HASH, password):
-            session['admin_logged_in'] = True
-            return redirect(url_for('admin_dashboard'))
-        return render_template_string(HTML_ADMIN_LOGIN, error='Sai thông tin đăng nhập')
-    return render_template_string(HTML_ADMIN_LOGIN)
-
-@app.route('/admin/logout')
-def admin_logout():
-    session.pop('admin_logged_in', None)
-    return redirect(url_for('admin_login'))
-
-@app.route('/admin')
-@require_admin
-def admin_dashboard():
-    return render_template_string(HTML_ADMIN_DASHBOARD)
-
-# ==================== TEMPLATES ====================
+# ==================== HTML TEMPLATE ====================
 HTML_INDEX = '''
 <!DOCTYPE html>
 <html lang="vi">
@@ -621,7 +580,7 @@ HTML_INDEX = '''
             <a class="navbar-brand text-white fw-bold" href="/"><i class="bi bi-rocket-takeoff"></i> Zefoy API</a>
             <div class="ms-auto d-flex align-items-center gap-2">
                 <span id="loginStatus" class="login-status logged-out"><i class="bi bi-circle-fill" style="font-size:8px;"></i> Chưa login</span>
-                <a href="/admin" class="btn btn-secondary btn-sm"><i class="bi bi-shield-lock"></i> Admin</a>
+                <a href="/api/status" target="_blank" class="btn btn-secondary btn-sm"><i class="bi bi-info-circle"></i> API</a>
             </div>
         </div>
     </nav>
@@ -652,7 +611,7 @@ HTML_INDEX = '''
                                 <div class="mt-2 d-flex gap-2 flex-wrap">
                                     <button class="btn btn-success btn-sm" id="autoSolve"><i class="bi bi-magic"></i> Auto Login</button>
                                     <button class="btn btn-secondary btn-sm" id="getServicesBtn"><i class="bi bi-list-ul"></i> Lấy Services</button>
-                                    <span class="text-muted small align-self-center">(Giải captcha trước khi gửi service)</span>
+                                    <span class="text-muted small align-self-center">(Cần login trước)</span>
                                 </div>
                             </div>
                         </div>
@@ -916,102 +875,6 @@ HTML_INDEX = '''
 </html>
 '''
 
-HTML_ADMIN_LOGIN = '''
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Admin Login</title>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-    <style>
-        body { background: #0d1117; color: #c9d1d9; min-height: 100vh; display: flex; align-items: center; }
-        .card { background: #161b22; border: 1px solid #30363d; border-radius: 12px; }
-        .card-header { background: transparent; border-bottom: 1px solid #30363d; }
-        .form-control { background: #0d1117; border: 1px solid #30363d; color: #c9d1d9; }
-        .form-control:focus { background: #0d1117; border-color: #58a6ff; color: #c9d1d9; box-shadow: 0 0 0 3px rgba(88,166,255,0.2); }
-        .btn-primary { background: #238636; border: none; }
-        .btn-primary:hover { background: #2ea043; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="row justify-content-center">
-            <div class="col-md-4">
-                <div class="card">
-                    <div class="card-header text-center"><h4><i class="bi bi-shield-lock"></i> Admin Login</h4></div>
-                    <div class="card-body">
-                        {% if error %}<div class="alert alert-danger">{{ error }}</div>{% endif %}
-                        <form method="POST">
-                            <div class="mb-3">
-                                <label class="form-label small text-muted">Username</label>
-                                <input type="text" name="username" class="form-control" required>
-                            </div>
-                            <div class="mb-3">
-                                <label class="form-label small text-muted">Password</label>
-                                <input type="password" name="password" class="form-control" required>
-                            </div>
-                            <button type="submit" class="btn btn-primary w-100">Đăng nhập</button>
-                        </form>
-                        <div class="text-center mt-3"><a href="/" class="text-muted small">← Quay lại</a></div>
-                    </div>
-                </div>
-            </div>
-        </div>
-    </div>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.0/font/bootstrap-icons.css" rel="stylesheet">
-</body>
-</html>
-'''
-
-HTML_ADMIN_DASHBOARD = '''
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <title>Admin Dashboard</title>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.0/font/bootstrap-icons.css" rel="stylesheet">
-    <style>
-        body { background: #0d1117; color: #c9d1d9; }
-        .navbar { background: #161b22 !important; border-bottom: 1px solid #30363d; }
-        .card { background: #161b22; border: 1px solid #30363d; border-radius: 12px; }
-        .card-header { background: transparent; border-bottom: 1px solid #30363d; }
-        .stat-card { text-align: center; padding: 20px; }
-        .stat-card .number { font-size: 2rem; font-weight: bold; color: #58a6ff; }
-        .stat-card .label { color: #8b949e; }
-    </style>
-</head>
-<body>
-    <nav class="navbar navbar-expand-lg sticky-top">
-        <div class="container-fluid">
-            <a class="navbar-brand text-white fw-bold" href="/admin"><i class="bi bi-shield-lock"></i> Zefoy Admin</a>
-            <a href="/admin/logout" class="btn btn-secondary btn-sm ms-auto"><i class="bi bi-box-arrow-right"></i> Đăng xuất</a>
-        </div>
-    </nav>
-    <div class="container-fluid pt-4">
-        <h4><i class="bi bi-speedometer2"></i> Dashboard</h4>
-        <div class="row g-3 mb-4">
-            <div class="col-md-3"><div class="card stat-card"><div class="number">2.1</div><div class="label">API Version</div></div></div>
-            <div class="col-md-3"><div class="card stat-card"><div class="number" style="color:#3fb950;">8</div><div class="label">Dịch vụ</div></div></div>
-            <div class="col-md-3"><div class="card stat-card"><div class="number" style="color:#3fb950;">OK</div><div class="label">Zefoy Status</div></div></div>
-        </div>
-        <div class="card">
-            <div class="card-header">🔑 API Endpoints</div>
-            <div class="card-body">
-                <div><code class="text-info">GET /api/captcha</code> - Lấy captcha</div>
-                <div><code class="text-info">POST /api/login</code> - Login bằng captcha</div>
-                <div><code class="text-info">POST /api/solve</code> - Auto login</div>
-                <div><code class="text-info">POST /api/submit</code> - Gửi service</div>
-                <div><code class="text-info">GET /api/services</code> - Danh sách service</div>
-                <div><code class="text-info">GET /api/status</code> - Trạng thái</div>
-            </div>
-        </div>
-    </div>
-</body>
-</html>
-'''
-
 # ==================== MAIN ROUTE ====================
 @app.route('/')
 def index():
@@ -1025,8 +888,12 @@ if __name__ == '__main__':
     print("🚀 ZEFOY API SERVER v2.1")
     print("=" * 50)
     print(f"📍 Port: {port}")
-    print(f"👤 Admin: admin / zefoy2026")
-    print("=" * 50)
-    print("📌 Flow đúng: Login → Lấy services → Gửi service")
+    print("📌 Endpoints:")
+    print("  GET  /api/captcha  - Lấy captcha")
+    print("  POST /api/login    - Login bằng captcha")
+    print("  POST /api/solve    - Auto login")
+    print("  POST /api/submit   - Gửi service")
+    print("  GET  /api/services - Danh sách service")
+    print("  GET  /api/status   - Trạng thái")
     print("=" * 50)
     app.run(host='0.0.0.0', port=port, debug=debug, threaded=True)
