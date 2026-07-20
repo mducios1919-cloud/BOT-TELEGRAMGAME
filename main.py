@@ -7,22 +7,30 @@ import requests
 import re
 import os
 import json
+import threading
+import sys
+import urllib3
 from bs4 import BeautifulSoup
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import pad
 
 app = Flask(__name__)
 CORS(app)
 
 # ==================== CONFIG ====================
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 BASE_URL = "https://zefoy.com"
 PASSPHRASE = "43fdda1192dde7f8ffff7161e13580d7"
+DEV_NAME = "trthaodev"
+SSL_VERIFY = False
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# ==================== CLASS ZEFOY CAPTCHA ====================
+# ==================== ZEFOY CAPTCHA ====================
 class ZefoyCaptcha:
     def __init__(self):
         self.session = requests.Session()
-        self.session.verify = False
-        self.user_agent = USER_AGENT
+        self.session.verify = SSL_VERIFY
+        self.user_agent = DEFAULT_USER_AGENT
         self.base_url = BASE_URL
     
     def get(self):
@@ -53,21 +61,48 @@ class ZefoyCaptcha:
         r.session_id = self.session.cookies.get('PHPSESSID')
         return r
 
-# ==================== CLASS ZEFOY CLIENT ====================
+# ==================== ZEFOY CLIENT ====================
 class ZefoyClient:
     def __init__(self):
         self.session = requests.Session()
-        self.session.verify = False
-        self.user_agent = USER_AGENT
+        self.session.verify = SSL_VERIFY
+        self.user_agent = DEFAULT_USER_AGENT
         self.base_url = BASE_URL
         self.total_sent = 0
-        self.services_cache = {}  # Lưu action và input_name
+        self.services = {}
+        self.services_ids = {}
+        self.services_status = {}
+        self.video_key = None
+    
+    def _parse_timer(self, html):
+        if not html:
+            return None
+        m = re.search(r'remainingTimelogin\s*=\s*(-?\d+)', html)
+        if m:
+            v = int(m.group(1))
+            return v if v > 0 else None
+        m = re.search(r'Please wait\s+(\d+)\s+seconds', html, re.I)
+        if m:
+            v = int(m.group(1))
+            return v if v > 0 else None
+        return None
+    
+    def _parse_sent_amount(self, html):
+        if not html:
+            return None, None, None
+        m = re.search(r'Successfully\s+(\d+)\s*([a-zA-Z ]*?)\s*sent\.?', html, re.I)
+        if m:
+            amount = int(m.group(1))
+            kind = (m.group(2) or '').strip().lower() or 'items'
+            msg = re.sub(r'\s+', ' ', m.group(0)).strip()
+            return amount, kind, msg
+        m = re.search(r'(\d+)\s*(views?|hearts?|likes?|shares?|followers?|favorites?)\s*sent', html, re.I)
+        if m:
+            return int(m.group(1)), m.group(2).lower(), m.group(0).strip()
+        return None, None, None
     
     def submit_captcha(self, answer):
         try:
-            from Crypto.Cipher import AES
-            from Crypto.Util.Padding import pad
-            
             fingerprint = {
                 'deviceInfo': {'cpuCores': 8, 'platform': 'Win32'},
                 'browserInfo': {'userAgent': self.user_agent, 'language': 'en'},
@@ -168,13 +203,6 @@ class ZefoyClient:
                     if inp:
                         input_name = inp.get('name')
                 
-                # ===== LƯU VÀO CACHE =====
-                if action and input_name:
-                    self.services_cache[title] = {
-                        'action': action,
-                        'input_name': input_name
-                    }
-                
                 status_lower = status.lower()
                 online = True
                 if 'soon' in status_lower or 'update' in status_lower or 'offline' in status_lower:
@@ -184,6 +212,10 @@ class ZefoyClient:
                 
                 if title not in service_titles:
                     service_titles.append(title)
+                    self.services[title] = status
+                    self.services_status[title] = online
+                    if action:
+                        self.services_ids[title] = action
                     services.append({
                         'title': title,
                         'status': status or 'Online',
@@ -192,69 +224,27 @@ class ZefoyClient:
                         'input_name': input_name
                     })
             
-            print(f"✅ Tìm thấy {len(services)} services")
-            for s in services:
-                print(f"   - {s['title']}: online={s['available']}, action={s['action']}")
-            
             return services
             
         except Exception as e:
             print(f"Get services error: {e}")
             return []
     
-    def _parse_timer(self, html):
-        if not html:
-            return None
-        m = re.search(r'remainingTimelogin\s*=\s*(-?\d+)', html)
-        if m:
-            v = int(m.group(1))
-            return v if v > 0 else None
-        m = re.search(r'Please wait\s+(\d+)\s+seconds', html, re.I)
-        if m:
-            v = int(m.group(1))
-            return v if v > 0 else None
-        return None
-    
-    def _parse_sent_amount(self, html):
-        if not html:
-            return None, None, None
-        m = re.search(r'Successfully\s+(\d+)\s*([a-zA-Z ]*?)\s*sent\.?', html, re.I)
-        if m:
-            amount = int(m.group(1))
-            kind = (m.group(2) or '').strip().lower() or 'items'
-            msg = re.sub(r'\s+', ' ', m.group(0)).strip()
-            return amount, kind, msg
-        return None, None, None
-    
     def run_service(self, service_title, video_url):
         try:
-            # ===== LẤY ACTION TỪ CACHE =====
-            if service_title in self.services_cache:
-                action = self.services_cache[service_title]['action']
-                input_name = self.services_cache[service_title]['input_name']
-                print(f"📦 Dùng action từ cache: {action}")
-            else:
+            # Lấy action từ cache
+            action = self.services_ids.get(service_title)
+            if not action:
                 # Fallback: lấy services mới
                 services = self.get_services()
-                target = None
                 for s in services:
-                    if s['title'].lower() == service_title.lower():
-                        target = s
+                    if s['title'] == service_title and s['action']:
+                        action = s['action']
                         break
-                
-                if not target:
-                    return {'success': False, 'message': f'Không tìm thấy service: {service_title}'}
-                
-                if not target['available']:
-                    return {'success': False, 'message': f'Service {service_title} đang offline'}
-                
-                if not target['action'] or not target['input_name']:
-                    return {'success': False, 'message': f'Không tìm thấy action cho service {service_title}'}
-                
-                action = target['action']
-                input_name = target['input_name']
             
-            # ===== GHÉP URL ĐÚNG =====
+            if not action:
+                return {'success': False, 'message': f'Không tìm thấy action cho {service_title}'}
+            
             if action.startswith('/'):
                 action_url = self.base_url.rstrip('/') + action
             elif action.startswith('http'):
@@ -262,10 +252,16 @@ class ZefoyClient:
             else:
                 action_url = self.base_url.rstrip('/') + '/' + action.lstrip('/')
             
-            print(f"   Action URL: {action_url}")
-            print(f"   Input name: {input_name}")
+            # Tìm input name
+            input_name = None
+            for s in self.get_services():
+                if s['title'] == service_title and s['input_name']:
+                    input_name = s['input_name']
+                    break
             
-            # ===== GỬI REQUEST =====
+            if not input_name:
+                input_name = 'url'
+            
             data = {input_name: video_url}
             
             resp = self.session.post(action_url, data=data, headers={
@@ -278,28 +274,25 @@ class ZefoyClient:
             response_text = resp.text
             
             if 'Session expired' in response_text:
-                return {'success': False, 'message': '⚠️ Session expired, cần lấy CAPTCHA lại'}
+                return {'success': False, 'message': '⚠️ Session expired'}
             
             wait = self._parse_timer(response_text)
             if wait and wait > 0:
-                return {'success': False, 'message': f'⏳ Vui lòng chờ {wait} giây...'}
+                return {'success': False, 'message': f'⏳ Chờ {wait}s'}
             
             amount, kind, sent_msg = self._parse_sent_amount(response_text)
             if amount is not None:
                 self.total_sent += amount
-                return {
-                    'success': True,
-                    'message': f'✅ {sent_msg}  |  Total: {self.total_sent}'
-                }
+                return {'success': True, 'message': f'✅ {sent_msg}  |  Total: {self.total_sent}'}
             
             if 'success' in response_text.lower():
                 return {'success': True, 'message': f'✅ Đã tăng {service_title} thành công!'}
             
             if 'Too many requests' in response_text:
-                return {'success': False, 'message': '⚠️ Too many requests, vui lòng chờ...'}
+                return {'success': False, 'message': '⚠️ Too many requests'}
             
             if 'service is currently not working' in response_text.lower():
-                return {'success': False, 'message': f'❌ Service {service_title} đang bảo trì'}
+                return {'success': False, 'message': f'❌ {service_title} đang bảo trì'}
             
             m = re.search(r"color:\s*green;?'?[^>]*>\s*([^<]+)", response_text, re.I)
             if m and 'Checking Timer' not in m.group(1):
@@ -311,14 +304,9 @@ class ZefoyClient:
             return {'success': False, 'message': str(e)}
 
 # ==================== CACHE ====================
-cache = {
-    'cookies': None,
-    'services': None,
-    'session_id': None,
-    'services_cache': {}  # Lưu action cho từng service
-}
+cache = {'cookies': None, 'services': None, 'session_id': None}
 
-# ==================== API ROUTES ====================
+# ==================== API ====================
 @app.route('/')
 def index():
     return jsonify({
@@ -338,9 +326,7 @@ def get_captcha():
     try:
         client = ZefoyCaptcha()
         captcha = client.get()
-        
         cache['cookies'] = client.session.cookies.get_dict()
-        
         return jsonify({
             'success': True,
             'data': {
@@ -376,16 +362,11 @@ def submit():
         if services:
             cache['services'] = services
             cache['session_id'] = client.session.cookies.get('PHPSESSID')
-            cache['services_cache'] = client.services_cache  # Lưu cache action
-            
             online = sum(1 for s in services if s['available'])
             return jsonify({
                 'success': True,
                 'message': f'✅ CAPTCHA đúng! {online} services online',
-                'data': {
-                    'session_id': cache['session_id'],
-                    'services': services
-                }
+                'data': {'session_id': cache['session_id'], 'services': services}
             })
         
         return jsonify({'success': False, 'message': '❌ CAPTCHA sai!'})
@@ -403,17 +384,10 @@ def get_services():
                     client.session.cookies.set(name, value)
             services = client.get_services()
             cache['services'] = services
-            cache['services_cache'] = client.services_cache
         else:
             services = cache['services']
         
-        return jsonify({
-            'success': True,
-            'data': {
-                'services': services,
-                'session_id': cache.get('session_id')
-            }
-        })
+        return jsonify({'success': True, 'data': {'services': services, 'session_id': cache.get('session_id')}})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
 
@@ -439,23 +413,24 @@ def run():
             for name, value in cache['cookies'].items():
                 client.session.cookies.set(name, value)
         
-        # ===== GÁN CACHE ACTION VÀO CLIENT =====
-        if cache.get('services_cache'):
-            client.services_cache = cache['services_cache']
-            print(f"📦 Đã load {len(client.services_cache)} actions từ cache")
+        # Lấy services từ cache nếu có
+        if cache.get('services'):
+            for s in cache['services']:
+                if s['title'] in client.services_ids:
+                    continue
+                if s['action']:
+                    client.services_ids[s['title']] = s['action']
         
         result = client.run_service(service_title, video_url)
         return jsonify(result)
         
     except Exception as e:
-        print(f"❌ Lỗi run_service: {e}")
         return jsonify({'success': False, 'message': str(e)})
 
 @app.route('/health')
 def health():
     return jsonify({'status': 'ok'})
 
-# ==================== MAIN ====================
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
     app.run(host='0.0.0.0', port=port)
