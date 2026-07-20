@@ -1,11 +1,11 @@
-# zefoy.py - Full version cho Replit
+# zefoy.py - Đặt TÊN FILE LÀ zefoy.py (KHÔNG phải thư mục)
 import base64
 import hashlib
 import time
 import requests
 import json
-from dataclasses import dataclass
-from typing import Optional
+import re
+import os
 
 DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
@@ -17,10 +17,10 @@ class ZefoyCaptcha:
         self.base_url = "https://zefoy.com"
     
     def get(self):
-        # Bước 1: GET / để lấy session
+        # GET / để lấy session
         self.session.get(self.base_url, timeout=30)
         
-        # Bước 2: GET CAPTCHA
+        # GET CAPTCHA
         ts = int(time.time())
         url = f"{self.base_url}/?getcapthca={ts}"
         resp = self.session.get(url, headers={
@@ -30,8 +30,6 @@ class ZefoyCaptcha:
         }, timeout=30)
         
         data = resp.json()
-        
-        # Lấy encoded value
         md5 = hashlib.md5(self.user_agent.encode()).hexdigest()
         encoded = data.get(md5)
         if not encoded:
@@ -40,14 +38,9 @@ class ZefoyCaptcha:
         # Double base64 decode
         once = base64.b64decode(encoded)
         path = base64.b64decode(once).decode().strip()
-        
-        # Tải ảnh
         image_url = f"{self.base_url}/{path.lstrip('/')}"
-        img_resp = self.session.get(image_url, headers={
-            'User-Agent': self.user_agent
-        }, timeout=30)
+        img_resp = self.session.get(image_url, headers={'User-Agent': self.user_agent}, timeout=30)
         
-        # Lấy token
         token = None
         if '_CAPTCHA=' in path:
             token = path.split('_CAPTCHA=')[1].split('&')[0]
@@ -69,7 +62,6 @@ class ZefoyClient:
         self.base_url = "https://zefoy.com"
     
     def solve_and_submit(self, max_attempts=3):
-        # Hàm này sẽ được gọi từ API
         class Result:
             pass
         result = Result()
@@ -79,15 +71,18 @@ class ZefoyClient:
             captcha_client = ZefoyCaptcha()
             captcha = captcha_client.get()
             
-            # OCR bằng NewOCR (đơn giản)
+            # OCR bằng NewOCR
             answer = self._ocr_captcha(captcha.image_bytes)
             
             if not answer:
                 result.success = False
                 result.message = "OCR failed"
+                result.answer = ""
+                result.session_id = ""
+                result.services = []
                 return result
             
-            # Submit CAPTCHA
+            # Submit
             submit_result = self._submit_captcha(answer)
             
             if submit_result:
@@ -99,18 +94,22 @@ class ZefoyClient:
             else:
                 result.success = False
                 result.message = "Submit failed"
+                result.answer = answer
+                result.session_id = ""
+                result.services = []
                 
         except Exception as e:
             result.success = False
             result.message = str(e)
+            result.answer = ""
+            result.session_id = ""
+            result.services = []
         
         return result
     
     def _ocr_captcha(self, image_bytes):
-        """OCR bằng NewOCR web"""
         try:
-            # Upload lên NewOCR
-            boundary = '----WebKitFormBoundary' + ''.join(['abcdefghijklmnopqrstuvwxyz0123456789'[i%36] for i in range(16)])
+            boundary = '----WebKitFormBoundary' + ''.join([chr(97 + (i % 26)) for i in range(16)])
             
             body = f"--{boundary}\r\n"
             body += 'Content-Disposition: form-data; name="preview"\r\n\r\n'
@@ -118,7 +117,7 @@ class ZefoyClient:
             body += f"--{boundary}\r\n"
             body += 'Content-Disposition: form-data; name="userfile"; filename="captcha.png"\r\n'
             body += 'Content-Type: application/octet-stream\r\n\r\n'
-            body += image_bytes.decode('latin-1') if isinstance(image_bytes, bytes) else str(image_bytes)
+            body += image_bytes.decode('latin-1')
             body += f"\r\n--{boundary}--\r\n"
             
             headers = {
@@ -128,14 +127,11 @@ class ZefoyClient:
             
             resp = self.session.post('https://www.newocr.com/', data=body.encode('latin-1'), headers=headers, timeout=60)
             
-            # Parse file ID
-            import re
             match = re.search(r'name="u"\s+value="([a-f0-9]{32})"', resp.text)
             if not match:
                 return ''
             file_id = match.group(1)
             
-            # OCR
             ocr_data = {
                 'u': file_id,
                 'ocr': '1',
@@ -146,7 +142,6 @@ class ZefoyClient:
             
             resp = self.session.post('https://www.newocr.com/', data=ocr_data, headers={'User-Agent': self.user_agent}, timeout=60)
             
-            # Parse kết quả
             match = re.search(r'<textarea[^>]*id="ocr-result"[^>]*>([\s\S]*?)</textarea>', resp.text)
             if match:
                 text = match.group(1).strip()
@@ -159,25 +154,20 @@ class ZefoyClient:
             return ''
     
     def _submit_captcha(self, answer):
-        """Submit CAPTCHA lên zefoy"""
         try:
-            # Tạo fingerprint (đơn giản)
+            import json
+            from Crypto.Cipher import AES
+            from Crypto.Util.Padding import pad
+            
             fingerprint = {
                 'deviceInfo': {'cpuCores': 8, 'platform': 'Win32'},
                 'browserInfo': {'userAgent': self.user_agent, 'language': 'en'},
                 'screenInfo': {'width': 1920, 'height': 1080}
             }
             
-            # Mã hóa AES (CryptoJS compatible)
-            import json
-            import os
-            from Crypto.Cipher import AES
-            from Crypto.Util.Padding import pad
-            
             passphrase = "43fdda1192dde7f8ffff7161e13580d7"
             salt = os.urandom(8)
             
-            # EVP_BytesToKey
             derived = b''
             block = b''
             while len(derived) < 48:
@@ -197,7 +187,6 @@ class ZefoyClient:
                 's': salt.hex()
             })
             
-            # Submit
             data = {
                 'captchalogin': answer,
                 'captcha_encoded': captcha_encoded
@@ -216,14 +205,10 @@ class ZefoyClient:
             return False
     
     def _get_services(self):
-        """Lấy danh sách services"""
         try:
             resp = self.session.get(self.base_url, headers={'User-Agent': self.user_agent}, timeout=30)
             
-            import re
             services = []
-            
-            # Parse services
             pattern = r'<h5[^>]*>([^<]+)</h5>\s*<small[^>]*>([^<]*)</small>'
             matches = re.findall(pattern, resp.text)
             
