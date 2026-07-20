@@ -7,6 +7,7 @@ import requests
 import re
 import os
 import json
+from bs4 import BeautifulSoup  # THÊM DÒNG NÀY
 
 app = Flask(__name__)
 CORS(app)
@@ -20,10 +21,7 @@ class ZefoyCaptcha:
         self.base_url = "https://zefoy.com"
     
     def get(self):
-        # GET / để lấy session
         self.session.get(self.base_url, timeout=30)
-        
-        # GET CAPTCHA
         ts = int(time.time())
         url = f"{self.base_url}/?getcapthca={ts}"
         resp = self.session.get(url, headers={
@@ -38,7 +36,6 @@ class ZefoyCaptcha:
         if not encoded:
             encoded = list(data.values())[0]
         
-        # Double base64 decode
         once = base64.b64decode(encoded)
         path = base64.b64decode(once).decode().strip()
         image_url = f"{self.base_url}/{path.lstrip('/')}"
@@ -61,21 +58,15 @@ class ZefoyClient:
     
     def submit_and_get_services(self, answer):
         try:
-            # Thử import Crypto, nếu ko có thì báo lỗi
-            try:
-                from Crypto.Cipher import AES
-                from Crypto.Util.Padding import pad
-            except ImportError:
-                return None
+            from Crypto.Cipher import AES
+            from Crypto.Util.Padding import pad
             
-            # Fingerprint
             fingerprint = {
                 'deviceInfo': {'cpuCores': 8, 'platform': 'Win32'},
                 'browserInfo': {'userAgent': self.user_agent, 'language': 'en'},
                 'screenInfo': {'width': 1920, 'height': 1080}
             }
             
-            # AES encrypt
             passphrase = "43fdda1192dde7f8ffff7161e13580d7"
             salt = os.urandom(8)
             
@@ -98,7 +89,6 @@ class ZefoyClient:
                 's': salt.hex()
             })
             
-            # Submit CAPTCHA
             data = {
                 'captchalogin': answer,
                 'captcha_encoded': captcha_encoded
@@ -116,7 +106,6 @@ class ZefoyClient:
             if body != 'success':
                 return None
             
-            # Lấy services
             return self.get_services()
             
         except Exception as e:
@@ -124,6 +113,7 @@ class ZefoyClient:
             return None
     
     def get_services(self):
+        """Lấy danh sách services - DÙNG BEAUTIFULSOUP GIỐNG PYTHON GỐC"""
         try:
             resp = self.session.get(self.base_url, headers={
                 'User-Agent': self.user_agent,
@@ -131,33 +121,92 @@ class ZefoyClient:
             }, timeout=30)
             
             html = resp.text
+            soup = BeautifulSoup(html, 'html.parser')
+            
             services = []
+            service_titles = []
+            service_statuses = []
             
-            # Parse services
-            titles = re.findall(r'<h5[^>]*>([^<]+)</h5>', html)
-            statuses = re.findall(r'<small[^>]*>([^<]*)</small>', html)
-            
-            for i, title in enumerate(titles):
-                title = title.strip()
+            # Cách 1: Tìm các card có class card-title và small
+            for card in soup.find_all('div', class_='card'):
+                title_el = card.find(['h5', 'h6', 'div'], class_=['card-title', 'mb-3'])
+                if not title_el:
+                    continue
+                
+                title = title_el.get_text(strip=True)
                 if not title or len(title) < 3:
                     continue
-                status = statuses[i].strip() if i < len(statuses) else 'Online'
-                available = not ('soon' in status.lower() or 'update' in status.lower() or 'offline' in status.lower())
-                services.append({
-                    'title': title,
-                    'status': status or 'Online',
-                    'available': available
-                })
+                
+                # Tìm status
+                status_el = card.find('small')
+                if not status_el:
+                    status_el = card.find('p', class_='card-text')
+                
+                status = status_el.get_text(strip=True) if status_el else 'Online'
+                
+                # Xác định online
+                status_lower = status.lower()
+                online = True
+                if 'soon' in status_lower or 'update' in status_lower or 'offline' in status_lower:
+                    online = False
+                if 'ago' in status_lower and 'updated' in status_lower:
+                    online = True
+                
+                # Tránh trùng lặp
+                if title not in service_titles:
+                    service_titles.append(title)
+                    service_statuses.append(status)
+                    services.append({
+                        'title': title,
+                        'status': status or 'Online',
+                        'available': online
+                    })
             
-            # Loại trùng
-            seen = set()
-            unique = []
+            # Cách 2: Nếu không tìm thấy, dùng regex nhưng lọc đúng
+            if len(services) == 0:
+                # Tìm tất cả h5 trong card
+                for h5 in soup.find_all('h5'):
+                    title = h5.get_text(strip=True)
+                    if not title or len(title) < 3:
+                        continue
+                    
+                    # Tìm small gần đó
+                    small = h5.find_next('small')
+                    if not small:
+                        small = h5.parent.find('small') if h5.parent else None
+                    
+                    status = small.get_text(strip=True) if small else 'Online'
+                    
+                    status_lower = status.lower()
+                    online = True
+                    if 'soon' in status_lower or 'update' in status_lower or 'offline' in status_lower:
+                        online = False
+                    if 'ago' in status_lower and 'updated' in status_lower:
+                        online = True
+                    
+                    if title not in service_titles:
+                        service_titles.append(title)
+                        service_statuses.append(status)
+                        services.append({
+                            'title': title,
+                            'status': status or 'Online',
+                            'available': online
+                        })
+            
+            # Lọc bỏ các mục không phải service thật
+            fake_keywords = ['terms', 'privacy', 'contact', 'policy', 'cookie', 'about']
+            real_services = []
             for s in services:
-                if s['title'] not in seen:
-                    seen.add(s['title'])
-                    unique.append(s)
+                title_lower = s['title'].lower()
+                is_fake = any(kw in title_lower for kw in fake_keywords)
+                if not is_fake:
+                    real_services.append(s)
             
-            return unique
+            print(f"✅ Đã tìm thấy {len(real_services)} services")
+            for s in real_services:
+                print(f"   - {s['title']}: {'Online' if s['available'] else 'Offline'}")
+            
+            return real_services
             
         except Exception as e:
             print(f"Get services error: {e}")
