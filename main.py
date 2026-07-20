@@ -7,32 +7,36 @@ import os
 # Thêm đường dẫn
 sys.path.insert(0, os.path.dirname(__file__))
 
+# Import zefoy - CÓ TRY/EXCEPT ĐÚNG
 try:
     from zefoy import ZefoyCaptcha, ZefoyClient
     print("✅ Import zefoy thành công!")
 except ImportError as e:
-    print(f"❌ Lỗi: {e}")
-    print("📁 Đang kiểm tra thư mục...")
+    print(f"❌ Lỗi import: {e}")
     print("📁 Files hiện có:", os.listdir('.'))
     
     # Tạo class giả nếu không có
     class ZefoyCaptcha:
         def get(self):
-            return type('obj', (object,), {
-                'image_bytes': b'fake',
-                'session_id': 'fake_session',
-                'captcha_token': 'fake_token'
-            })()
+            class Result:
+                pass
+            r = Result()
+            r.image_bytes = b'fake'
+            r.session_id = 'fake_session'
+            r.captcha_token = 'fake_token'
+            return r
     
     class ZefoyClient:
         def solve_and_submit(self, max_attempts=3):
-            return type('obj', (object,), {
-                'success': False,
-                'answer': '',
-                'session_id': '',
-                'services': [],
-                'message': 'Zefoy module not available'
-            })()
+            class Result:
+                pass
+            r = Result()
+            r.success = False
+            r.answer = ''
+            r.session_id = ''
+            r.services = []
+            r.message = 'Zefoy module not available'
+            return r
     
     print("⚠️ Đang dùng class giả (zefoy không có sẵn)")
 
@@ -57,6 +61,13 @@ def get_captcha():
         print("🔄 Lấy CAPTCHA...")
         client = ZefoyCaptcha()
         captcha = client.get()
+        
+        # Kiểm tra nếu là fake data
+        if captcha.image_bytes == b'fake':
+            return jsonify({
+                'success': False,
+                'error': 'Zefoy module not available - đang dùng class giả'
+            })
         
         return jsonify({
             'success': True,
@@ -100,7 +111,10 @@ def solve_submit():
                 }
             })
         
-        return jsonify({'success': False, 'message': 'Submit failed'})
+        return jsonify({
+            'success': False, 
+            'message': result.message if hasattr(result, 'message') else 'Submit failed'
+        })
         
     except Exception as e:
         print(f"❌ Lỗi: {e}")
