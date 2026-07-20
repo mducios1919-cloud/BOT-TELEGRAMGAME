@@ -230,7 +230,7 @@ def solve_captcha(image_bytes):
         print(f"OCR error: {e}")
         return ""
 
-# ==================== ZEFOY CLIENT ====================
+# ==================== ZEFOY CLIENT (SỬA LẠI) ====================
 class ZefoyClient:
     def __init__(self):
         self.session = requests.Session()
@@ -238,14 +238,17 @@ class ZefoyClient:
         self.captcha_client = ZefoyCaptcha(self.session)
         self.base_url = DEFAULT_BASE_URL
         self.user_agent = DEFAULT_USER_AGENT
+        self.is_logged_in = False
+        self.services_cache = []
     
     def get_captcha(self):
         return self.captcha_client.get()
     
-    def submit_answer(self, answer, captcha):
+    def login(self, answer):
+        """Đăng nhập bằng captcha"""
         answer = re.sub(r'[^a-z]', '', answer.lower())
         if not answer:
-            raise Exception("Empty answer")
+            return {"success": False, "error": "Empty answer"}
         
         self.captcha_client.ensure_session()
         encoded = build_captcha_encoded(self.user_agent)
@@ -262,132 +265,157 @@ class ZefoyClient:
         xhr_ok = resp.status_code == 200 and xhr_body.lower() == "success"
         
         if xhr_ok:
+            # GET lại trang để lấy services
             follow = self.session.get(self.base_url, timeout=30)
             html = follow.text
-            success = not ('name="captchalogin"' in html or 'id="captcha-img"' in html)
-            return {"success": success, "html": html, "message": "ok"}
-        return {"success": False, "message": f"Rejected: {xhr_body[:100]}"}
+            self.is_logged_in = True
+            # Lấy services ngay sau khi login
+            self.services_cache = self._parse_services(html)
+            return {"success": True, "html": html, "services": self.services_cache}
+        
+        return {"success": False, "error": f"Login failed: {xhr_body[:100]}"}
     
-    def solve_and_submit(self, max_attempts=3):
+    def _parse_services(self, html):
+        """Parse danh sách services từ HTML"""
+        services = []
+        soup = BeautifulSoup(html, "html.parser")
+        
+        for card in soup.select("div.card"):
+            title_el = card.select_one("h5, h6, .card-title, .toptitle")
+            if not title_el:
+                continue
+            title = title_el.get_text(strip=True)
+            if not title:
+                continue
+            
+            status_el = card.select_one("p.card-text, .card-text, p")
+            raw_status = status_el.get_text(" ", strip=True) if status_el else ""
+            if raw_status.lower() in ("search", "search."):
+                raw_status = ""
+            
+            form = card.select_one("form")
+            action = form.get("action") if form else None
+            inp = None
+            if form:
+                inp = form.select_one("input[type=text], input.form-control, input:not([type=hidden])")
+            input_name = inp.get("name") if inp else None
+            
+            available = False
+            if raw_status:
+                if "online" in raw_status.lower() or "update" in raw_status.lower() or "days ago" in raw_status.lower():
+                    available = True
+            elif action:
+                available = True
+            
+            services.append({
+                "title": title,
+                "status": raw_status or "Online",
+                "available": available,
+                "action": action,
+                "input_name": input_name
+            })
+        
+        return services
+    
+    def get_services(self):
+        """Lấy danh sách services (phải login trước)"""
+        if not self.is_logged_in:
+            return []
+        if self.services_cache:
+            return self.services_cache
+        
+        html = self.session.get(self.base_url, timeout=30).text
+        self.services_cache = self._parse_services(html)
+        return self.services_cache
+    
+    def submit_service(self, link, service_name):
+        """Gửi service (phải login trước)"""
+        if not self.is_logged_in:
+            return {"success": False, "error": "Chưa đăng nhập. Vui lòng giải captcha trước"}
+        
+        # Lấy services mới nhất
+        services = self.get_services()
+        
+        # Tìm service
+        service_action = None
+        service_input = None
+        
+        for svc in services:
+            if svc["title"].lower() == service_name.lower():
+                service_action = svc.get("action")
+                service_input = svc.get("input_name")
+                break
+        
+        if not service_action:
+            # Fallback: tìm bằng regex
+            html = self.session.get(self.base_url, timeout=30).text
+            for m in re.finditer(r'<form action="([^"]+)"[^>]*>[\s\S]*?name="([^"]+)"[^>]*placeholder="Enter Video', html, re.I):
+                prev = html[max(0, m.start() - 400):m.start()]
+                titles = re.findall(r'<h5[^>]*>([^<]+)</h5>', prev)
+                title = titles[-1].strip() if titles else service_name
+                if title.lower() == service_name.lower():
+                    service_action = m.group(1)
+                    service_input = m.group(2)
+                    break
+        
+        if not service_action:
+            return {"success": False, "error": f"Service '{service_name}' not found"}
+        
+        # Submit
+        url = service_action if service_action.startswith("http") else f"{self.base_url}{service_action}"
+        token = "".join(random.choices(ascii_letters + digits, k=16))
+        boundary = f'----WebKitFormBoundary{token}'
+        
+        parts = [f'--{boundary}\r\nContent-Disposition: form-data; name="{service_input or "video_url"}"\r\n\r\n{link}\r\n']
+        parts.append(f'--{boundary}--\r\n')
+        body = ''.join(parts)
+        
+        resp = self.session.post(
+            url,
+            headers={
+                'content-type': f'multipart/form-data; boundary={boundary}',
+                'user-agent': self.user_agent,
+                'origin': self.base_url,
+                'referer': self.base_url,
+                'accept': '*/*'
+            },
+            data=body.encode('utf-8'),
+            timeout=45
+        )
+        
+        text = resp.text.strip()
+        if text.lower() == 'success':
+            return {"success": True, "message": "Đã gửi thành công"}
+        
+        try:
+            decoded = base64.b64decode(text).decode('utf-8', errors='replace')
+            if 'success' in decoded.lower():
+                return {"success": True, "message": decoded}
+        except:
+            pass
+        
+        return {"success": False, "message": text or "Không có phản hồi"}
+    
+    def solve_and_login(self, max_attempts=3):
+        """Tự động giải captcha và đăng nhập"""
         for attempt in range(max_attempts):
             try:
                 captcha = self.get_captcha()
                 answer = solve_captcha(captcha.image_bytes)
                 if not answer:
                     continue
-                result = self.submit_answer(answer, captcha)
+                result = self.login(answer)
                 if result["success"]:
-                    return {"success": True, "answer": answer, "attempts": attempt + 1}
+                    return {
+                        "success": True,
+                        "answer": answer,
+                        "attempts": attempt + 1,
+                        "services": result.get("services", [])
+                    }
             except Exception as e:
                 print(f"Attempt {attempt + 1} failed: {e}")
-                time.sleep(1)
+                time.sleep(2)
         return {"success": False, "error": "Max attempts reached"}
-    
-    def submit_service(self, link, service_name):
-        try:
-            # Lấy session và services
-            self.captcha_client.ensure_session()
-            html = self.session.get(self.base_url, timeout=30).text
-            
-            # Parse services
-            soup = BeautifulSoup(html, "html.parser")
-            service_action = None
-            service_input = None
-            
-            for card in soup.select("div.card"):
-                title_el = card.select_one("h5, h6, .card-title")
-                if not title_el:
-                    continue
-                title = title_el.get_text(strip=True)
-                if title.lower() == service_name.lower():
-                    form = card.select_one("form")
-                    if form:
-                        service_action = form.get("action")
-                        inp = form.select_one("input[type=text], input.form-control")
-                        if inp:
-                            service_input = inp.get("name")
-                    break
-            
-            if not service_action:
-                # Fallback: tìm bằng regex
-                for m in re.finditer(r'<form action="([^"]+)"[^>]*>[\s\S]*?name="([^"]+)"[^>]*placeholder="Enter Video', html, re.I):
-                    prev = html[max(0, m.start() - 400):m.start()]
-                    titles = re.findall(r'<h5[^>]*>([^<]+)</h5>', prev)
-                    title = titles[-1].strip() if titles else service_name
-                    if title.lower() == service_name.lower():
-                        service_action = m.group(1)
-                        service_input = m.group(2)
-                        break
-            
-            if not service_action:
-                return {"success": False, "error": f"Service '{service_name}' not found"}
-            
-            # Submit
-            url = service_action if service_action.startswith("http") else f"{self.base_url}{service_action}"
-            token = "".join(random.choices(ascii_letters + digits, k=16))
-            boundary = f'----WebKitFormBoundary{token}'
-            
-            parts = [f'--{boundary}\r\nContent-Disposition: form-data; name="{service_input or "video_url"}"\r\n\r\n{link}\r\n']
-            parts.append(f'--{boundary}--\r\n')
-            body = ''.join(parts)
-            
-            resp = self.session.post(
-                url,
-                headers={
-                    'content-type': f'multipart/form-data; boundary={boundary}',
-                    'user-agent': self.user_agent,
-                    'origin': self.base_url,
-                    'referer': self.base_url,
-                    'accept': '*/*'
-                },
-                data=body.encode('utf-8'),
-                timeout=45
-            )
-            
-            text = resp.text.strip()
-            if text.lower() == 'success':
-                return {"success": True, "message": "Đã gửi thành công"}
-            
-            try:
-                decoded = base64.b64decode(text).decode('utf-8', errors='replace')
-                if 'success' in decoded.lower():
-                    return {"success": True, "message": decoded}
-            except:
-                pass
-            
-            return {"success": False, "message": text or "Không có phản hồi"}
-            
-        except Exception as e:
-            return {"success": False, "error": str(e)}
-    
-    def get_services(self):
-        try:
-            self.captcha_client.ensure_session()
-            html = self.session.get(self.base_url, timeout=30).text
-            soup = BeautifulSoup(html, "html.parser")
-            services = []
-            
-            for card in soup.select("div.card"):
-                title_el = card.select_one("h5, h6, .card-title")
-                if not title_el:
-                    continue
-                title = title_el.get_text(strip=True)
-                status_el = card.select_one("p.card-text, .card-text, p")
-                raw_status = status_el.get_text(" ", strip=True) if status_el else ""
-                
-                available = False
-                if raw_status:
-                    if "online" in raw_status.lower() or "update" in raw_status.lower() or "days ago" in raw_status.lower():
-                        available = True
-                
-                if not raw_status and card.select_one("form"):
-                    available = True
-                
-                services.append({"title": title, "status": raw_status or "Online", "available": available})
-            
-            return services
-        except Exception as e:
-            return []
 
 # ==================== API ENDPOINTS ====================
 @app.route('/api/captcha', methods=['GET'])
@@ -405,21 +433,46 @@ def api_get_captcha():
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
-@app.route('/api/solve', methods=['POST'])
-def api_solve():
+@app.route('/api/login', methods=['POST'])
+def api_login():
+    """Đăng nhập bằng captcha"""
     try:
         data = request.get_json()
-        link = data.get('link', '').strip() if data else ''
+        if not data:
+            return jsonify({'success': False, 'error': 'Missing data'}), 400
+        
+        answer = data.get('answer', '').strip()
+        if not answer:
+            return jsonify({'success': False, 'error': 'Vui lòng nhập captcha'}), 400
         
         client = ZefoyClient()
-        result = client.solve_and_submit(max_attempts=3)
+        result = client.login(answer)
+        
+        if result["success"]:
+            return jsonify({
+                'success': True,
+                'message': 'Đăng nhập thành công',
+                'services': result.get("services", [])
+            })
+        else:
+            return jsonify({'success': False, 'error': result.get('error', 'Đăng nhập thất bại')}), 400
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/solve', methods=['POST'])
+def api_solve():
+    """Tự động giải captcha và đăng nhập"""
+    try:
+        client = ZefoyClient()
+        result = client.solve_and_login(max_attempts=3)
         
         if result.get('success'):
             return jsonify({
                 'success': True,
                 'message': 'Đăng nhập thành công',
                 'answer': result.get('answer'),
-                'attempts': result.get('attempts')
+                'attempts': result.get('attempts'),
+                'services': result.get('services', [])
             })
         else:
             return jsonify({
@@ -431,6 +484,7 @@ def api_solve():
 
 @app.route('/api/submit', methods=['POST'])
 def api_submit():
+    """Gửi service (phải login trước)"""
     try:
         data = request.get_json()
         if not data:
@@ -438,11 +492,25 @@ def api_submit():
         
         link = data.get('link', '').strip()
         service = data.get('service', 'Comments Hearts')
+        answer = data.get('answer', '').strip()
         
         if not link:
             return jsonify({'success': False, 'error': 'Vui lòng nhập link video'}), 400
         
         client = ZefoyClient()
+        
+        # Nếu có captcha thì login trước
+        if answer:
+            login_result = client.login(answer)
+            if not login_result["success"]:
+                return jsonify({'success': False, 'error': login_result.get('error', 'Đăng nhập thất bại')}), 400
+        else:
+            # Auto login
+            login_result = client.solve_and_login(max_attempts=3)
+            if not login_result.get("success"):
+                return jsonify({'success': False, 'error': login_result.get('error', 'Không thể đăng nhập')}), 400
+        
+        # Submit service
         result = client.submit_service(link, service)
         
         if result.get('success'):
@@ -454,8 +522,15 @@ def api_submit():
 
 @app.route('/api/services', methods=['GET'])
 def api_services():
+    """Lấy danh sách services (phải login trước)"""
     try:
         client = ZefoyClient()
+        # Login tự động nếu chưa login
+        if not client.is_logged_in:
+            login_result = client.solve_and_login(max_attempts=2)
+            if not login_result.get("success"):
+                return jsonify({'success': False, 'error': 'Không thể đăng nhập'}), 400
+        
         services = client.get_services()
         return jsonify({'success': True, 'services': services})
     except Exception as e:
@@ -465,9 +540,12 @@ def api_services():
 def api_status():
     return jsonify({
         'status': 'running',
-        'version': '2.0',
+        'version': '2.1',
         'timestamp': datetime.now().isoformat(),
-        'endpoints': ['/api/captcha', '/api/solve', '/api/submit', '/api/services', '/api/status']
+        'endpoints': [
+            '/api/captcha', '/api/login', '/api/solve', 
+            '/api/submit', '/api/services', '/api/status'
+        ]
     })
 
 # ==================== ADMIN ====================
@@ -521,6 +599,8 @@ HTML_INDEX = '''
         .btn-primary:hover { background: #2ea043; }
         .btn-secondary { background: #21262d; border: 1px solid #30363d; }
         .btn-secondary:hover { background: #30363d; }
+        .btn-success { background: #1a7f37; border: none; }
+        .btn-success:hover { background: #2ea043; }
         .captcha-img { border-radius: 8px; border: 1px solid #30363d; max-width: 100%; max-height: 120px; }
         .log-area { background: #0d1117; border: 1px solid #30363d; border-radius: 8px; padding: 12px; max-height: 200px; overflow-y: auto; font-family: monospace; font-size: 13px; color: #8b949e; }
         .log-area .log-success { color: #3fb950; }
@@ -529,15 +609,19 @@ HTML_INDEX = '''
         .service-badge { background: #21262d; padding: 4px 12px; border-radius: 20px; font-size: 12px; cursor: pointer; border: 1px solid #30363d; display: inline-block; margin: 2px; }
         .service-badge:hover { border-color: #58a6ff; }
         .service-badge.active { background: #238636; border-color: #238636; color: #fff; }
+        .service-badge.offline { opacity: 0.5; }
+        .login-status { padding: 8px 16px; border-radius: 20px; font-size: 13px; }
+        .login-status.logged-in { background: #1a7f37; color: #fff; }
+        .login-status.logged-out { background: #21262d; color: #8b949e; }
     </style>
 </head>
 <body>
     <nav class="navbar navbar-expand-lg sticky-top">
         <div class="container">
             <a class="navbar-brand text-white fw-bold" href="/"><i class="bi bi-rocket-takeoff"></i> Zefoy API</a>
-            <div class="ms-auto">
-                <span class="text-muted small">v2.0</span>
-                <a href="/admin" class="btn btn-secondary btn-sm ms-2"><i class="bi bi-shield-lock"></i> Admin</a>
+            <div class="ms-auto d-flex align-items-center gap-2">
+                <span id="loginStatus" class="login-status logged-out"><i class="bi bi-circle-fill" style="font-size:8px;"></i> Chưa login</span>
+                <a href="/admin" class="btn btn-secondary btn-sm"><i class="bi bi-shield-lock"></i> Admin</a>
             </div>
         </div>
     </nav>
@@ -548,27 +632,7 @@ HTML_INDEX = '''
                     <h1 class="display-5 fw-bold">🚀 Tool Tăng Tương Tác TikTok</h1>
                     <p class="text-muted">Comments Hearts, Views, Followers, Shares và nhiều hơn</p>
                 </div>
-                <div class="card mb-3">
-                    <div class="card-body">
-                        <div class="row g-3">
-                            <div class="col-md-8">
-                                <label class="form-label small text-muted">Link video TikTok</label>
-                                <input type="text" class="form-control" id="videoLink" placeholder="https://www.tiktok.com/@user/video/123456789">
-                            </div>
-                            <div class="col-md-4">
-                                <label class="form-label small text-muted">Chọn dịch vụ</label>
-                                <select class="form-select" id="serviceSelect">
-                                    <option value="Comments Hearts">💬 Comments Hearts</option>
-                                    <option value="Views">👁️ Views</option>
-                                    <option value="Hearts">❤️ Hearts</option>
-                                    <option value="Followers">👥 Followers</option>
-                                    <option value="Shares">🔄 Shares</option>
-                                    <option value="Favorites">⭐ Favorites</option>
-                                </select>
-                            </div>
-                        </div>
-                    </div>
-                </div>
+                
                 <div class="card mb-3">
                     <div class="card-header d-flex justify-content-between align-items-center">
                         <span><i class="bi bi-shield-check"></i> Xác thực Captcha</span>
@@ -583,26 +647,62 @@ HTML_INDEX = '''
                             <div class="col-md-8">
                                 <div class="input-group">
                                     <input type="text" class="form-control" id="captchaAnswer" placeholder="Nhập captcha">
-                                    <button class="btn btn-primary" id="solveBtn"><i class="bi bi-check2-circle"></i> Giải</button>
+                                    <button class="btn btn-primary" id="loginBtn"><i class="bi bi-box-arrow-in-right"></i> Login</button>
                                 </div>
-                                <div class="mt-2">
-                                    <button class="btn btn-secondary btn-sm" id="autoSolve"><i class="bi bi-magic"></i> Auto Solve</button>
+                                <div class="mt-2 d-flex gap-2 flex-wrap">
+                                    <button class="btn btn-success btn-sm" id="autoSolve"><i class="bi bi-magic"></i> Auto Login</button>
+                                    <button class="btn btn-secondary btn-sm" id="getServicesBtn"><i class="bi bi-list-ul"></i> Lấy Services</button>
+                                    <span class="text-muted small align-self-center">(Giải captcha trước khi gửi service)</span>
                                 </div>
                             </div>
                         </div>
                     </div>
                 </div>
+
+                <div class="card mb-3">
+                    <div class="card-body">
+                        <div class="row g-3">
+                            <div class="col-md-7">
+                                <label class="form-label small text-muted">Link video TikTok</label>
+                                <input type="text" class="form-control" id="videoLink" placeholder="https://www.tiktok.com/@user/video/123456789">
+                            </div>
+                            <div class="col-md-5">
+                                <label class="form-label small text-muted">Chọn dịch vụ</label>
+                                <select class="form-select" id="serviceSelect">
+                                    <option value="Comments Hearts">💬 Comments Hearts</option>
+                                    <option value="Views">👁️ Views</option>
+                                    <option value="Hearts">❤️ Hearts</option>
+                                    <option value="Followers">👥 Followers</option>
+                                    <option value="Shares">🔄 Shares</option>
+                                    <option value="Favorites">⭐ Favorites</option>
+                                </select>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
                 <div class="card mb-3">
                     <div class="card-header"><i class="bi bi-terminal"></i> Log</div>
                     <div class="card-body"><div id="logArea" class="log-area"><div class="log-info">🔹 Chờ thực hiện...</div></div></div>
                 </div>
+
+                <div class="card mb-3">
+                    <div class="card-header"><i class="bi bi-list-ul"></i> Dịch vụ khả dụng</div>
+                    <div class="card-body" id="servicesContainer">
+                        <span class="text-muted">🔹 Đăng nhập để xem dịch vụ</span>
+                    </div>
+                </div>
+
                 <button class="btn btn-primary w-100 btn-lg" id="submitBtn"><i class="bi bi-play-circle"></i> Bắt đầu</button>
             </div>
         </div>
     </div>
+
     <script>
         let currentSessionId = null;
         let isProcessing = false;
+        let isLoggedIn = false;
+
         function log(msg, type='info') {
             const area = document.getElementById('logArea');
             const d = document.createElement('div');
@@ -611,6 +711,41 @@ HTML_INDEX = '''
             area.appendChild(d);
             area.scrollTop = area.scrollHeight;
         }
+
+        function updateLoginStatus(status) {
+            const el = document.getElementById('loginStatus');
+            if (status) {
+                el.className = 'login-status logged-in';
+                el.innerHTML = '<i class="bi bi-circle-fill" style="font-size:8px;"></i> Đã login';
+                isLoggedIn = true;
+            } else {
+                el.className = 'login-status logged-out';
+                el.innerHTML = '<i class="bi bi-circle-fill" style="font-size:8px;"></i> Chưa login';
+                isLoggedIn = false;
+            }
+        }
+
+        function renderServices(services) {
+            const container = document.getElementById('servicesContainer');
+            if (!services || services.length === 0) {
+                container.innerHTML = '<span class="text-muted">🔹 Không có dịch vụ nào</span>';
+                return;
+            }
+            container.innerHTML = services.map(s => 
+                `<span class="service-badge ${s.available ? 'active' : 'offline'}" 
+                     onclick="selectService('${s.title}')">
+                    ${s.available ? '🟢' : '🔴'} ${s.title}
+                </span>`
+            ).join(' ');
+        }
+
+        function selectService(title) {
+            document.getElementById('serviceSelect').value = title;
+            document.querySelectorAll('.service-badge').forEach(el => {
+                el.classList.toggle('active', el.textContent.includes(title));
+            });
+        }
+
         async function refreshCaptcha() {
             try {
                 log('Đang tải captcha...', 'info');
@@ -620,79 +755,162 @@ HTML_INDEX = '''
                     currentSessionId = data.session_id;
                     document.getElementById('captchaImg').src = 'data:image/png;base64,' + data.image;
                     document.getElementById('captchaStatus').textContent = '✅ Captcha đã tải';
+                    document.getElementById('captchaAnswer').value = '';
                     log('Captcha đã tải', 'success');
+                    updateLoginStatus(false);
                 } else {
                     log('Lỗi: ' + data.error, 'error');
                 }
             } catch(e) { log('Lỗi: ' + e.message, 'error'); }
         }
-        async function autoSolve() {
-            if (!currentSessionId) await refreshCaptcha();
+
+        async function login(answer) {
+            if (!answer) {
+                log('⚠️ Vui lòng nhập captcha', 'error');
+                return false;
+            }
             try {
-                log('Đang auto solve...', 'info');
+                log('Đang đăng nhập...', 'info');
+                const resp = await fetch('/api/login', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({answer: answer})
+                });
+                const data = await resp.json();
+                if (data.success) {
+                    log('✅ Đăng nhập thành công!', 'success');
+                    updateLoginStatus(true);
+                    if (data.services) {
+                        renderServices(data.services);
+                        log('📋 Đã tải ' + data.services.length + ' dịch vụ', 'success');
+                    }
+                    return true;
+                } else {
+                    log('❌ Đăng nhập thất bại: ' + (data.error || 'Unknown error'), 'error');
+                    return false;
+                }
+            } catch(e) {
+                log('❌ Lỗi: ' + e.message, 'error');
+                return false;
+            }
+        }
+
+        async function autoSolve() {
+            try {
+                log('🔓 Đang auto login...', 'info');
                 const resp = await fetch('/api/solve', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({link: document.getElementById('videoLink').value || 'https://www.tiktok.com/@test/video/123'})
+                    body: JSON.stringify({})
                 });
                 const data = await resp.json();
                 if (data.success) {
                     document.getElementById('captchaAnswer').value = data.answer || '';
-                    log('✅ Auto solve: ' + data.answer, 'success');
+                    log('✅ Auto login thành công! Captcha: ' + data.answer, 'success');
+                    updateLoginStatus(true);
+                    if (data.services) {
+                        renderServices(data.services);
+                        log('📋 Đã tải ' + data.services.length + ' dịch vụ', 'success');
+                    }
+                    return true;
                 } else {
-                    log('❌ Thất bại: ' + data.error, 'error');
+                    log('❌ Auto login thất bại: ' + (data.error || 'Unknown'), 'error');
+                    return false;
                 }
-            } catch(e) { log('Lỗi: ' + e.message, 'error'); }
+            } catch(e) {
+                log('❌ Lỗi: ' + e.message, 'error');
+                return false;
+            }
         }
+
+        async function getServices() {
+            if (!isLoggedIn) {
+                log('⚠️ Vui lòng đăng nhập trước', 'error');
+                return;
+            }
+            try {
+                log('📋 Đang lấy danh sách dịch vụ...', 'info');
+                const resp = await fetch('/api/services');
+                const data = await resp.json();
+                if (data.success) {
+                    renderServices(data.services);
+                    log('📋 Đã tải ' + data.services.length + ' dịch vụ', 'success');
+                } else {
+                    log('❌ Lỗi: ' + data.error, 'error');
+                }
+            } catch(e) {
+                log('❌ Lỗi: ' + e.message, 'error');
+            }
+        }
+
         async function submit() {
             if (isProcessing) return;
             isProcessing = true;
             const btn = document.getElementById('submitBtn');
             btn.disabled = true;
             btn.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span> Đang xử lý...';
+
             try {
                 const link = document.getElementById('videoLink').value.trim();
                 const service = document.getElementById('serviceSelect').value;
-                if (!link) { log('⚠️ Nhập link video', 'error'); return; }
-                if (!currentSessionId) await refreshCaptcha();
                 const answer = document.getElementById('captchaAnswer').value.trim();
-                if (!answer) {
-                    log('Đang auto solve...', 'info');
-                    const sr = await fetch('/api/solve', {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({link: link})
-                    });
-                    const sd = await sr.json();
-                    if (!sd.success) { log('❌ ' + sd.error, 'error'); return; }
-                    document.getElementById('captchaAnswer').value = sd.answer;
+
+                if (!link) {
+                    log('⚠️ Nhập link video', 'error');
+                    return;
                 }
+
                 log('🚀 Đang gửi ' + service + '...', 'info');
+                
                 const resp = await fetch('/api/submit', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({link: link, service: service})
+                    body: JSON.stringify({
+                        link: link,
+                        service: service,
+                        answer: answer || undefined
+                    })
                 });
                 const data = await resp.json();
                 if (data.success) {
                     log('✅ ' + (data.message || 'Thành công!'), 'success');
                 } else {
                     log('❌ ' + (data.error || data.message || 'Thất bại'), 'error');
+                    if (data.error && data.error.includes('login')) {
+                        updateLoginStatus(false);
+                    }
                 }
-            } catch(e) { log('❌ ' + e.message, 'error'); }
+            } catch(e) {
+                log('❌ ' + e.message, 'error');
+            }
             finally {
                 isProcessing = false;
                 btn.disabled = false;
                 btn.innerHTML = '<i class="bi bi-play-circle"></i> Bắt đầu';
             }
         }
+
+        // Event listeners
         document.getElementById('refreshCaptcha').addEventListener('click', refreshCaptcha);
+        document.getElementById('loginBtn').addEventListener('click', () => {
+            login(document.getElementById('captchaAnswer').value.trim());
+        });
         document.getElementById('autoSolve').addEventListener('click', autoSolve);
+        document.getElementById('getServicesBtn').addEventListener('click', getServices);
         document.getElementById('submitBtn').addEventListener('click', submit);
-        document.getElementById('solveBtn').addEventListener('click', () => {});
-        document.getElementById('captchaAnswer').addEventListener('keypress', (e) => { if(e.key==='Enter') submit(); });
-        document.getElementById('videoLink').addEventListener('keypress', (e) => { if(e.key==='Enter') submit(); });
-        window.onload = function() { refreshCaptcha(); log('🚀 Zefoy API đã sẵn sàng', 'success'); };
+
+        document.getElementById('captchaAnswer').addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') login(document.getElementById('captchaAnswer').value.trim());
+        });
+        document.getElementById('videoLink').addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') submit();
+        });
+
+        window.onload = function() {
+            refreshCaptcha();
+            log('🚀 Zefoy API đã sẵn sàng', 'success');
+            log('💡 Hướng dẫn: Login → Chọn service → Gửi', 'info');
+        };
     </script>
 </body>
 </html>
@@ -774,7 +992,7 @@ HTML_ADMIN_DASHBOARD = '''
     <div class="container-fluid pt-4">
         <h4><i class="bi bi-speedometer2"></i> Dashboard</h4>
         <div class="row g-3 mb-4">
-            <div class="col-md-3"><div class="card stat-card"><div class="number">2.0</div><div class="label">API Version</div></div></div>
+            <div class="col-md-3"><div class="card stat-card"><div class="number">2.1</div><div class="label">API Version</div></div></div>
             <div class="col-md-3"><div class="card stat-card"><div class="number" style="color:#3fb950;">8</div><div class="label">Dịch vụ</div></div></div>
             <div class="col-md-3"><div class="card stat-card"><div class="number" style="color:#3fb950;">OK</div><div class="label">Zefoy Status</div></div></div>
         </div>
@@ -782,7 +1000,8 @@ HTML_ADMIN_DASHBOARD = '''
             <div class="card-header">🔑 API Endpoints</div>
             <div class="card-body">
                 <div><code class="text-info">GET /api/captcha</code> - Lấy captcha</div>
-                <div><code class="text-info">POST /api/solve</code> - Giải captcha</div>
+                <div><code class="text-info">POST /api/login</code> - Login bằng captcha</div>
+                <div><code class="text-info">POST /api/solve</code> - Auto login</div>
                 <div><code class="text-info">POST /api/submit</code> - Gửi service</div>
                 <div><code class="text-info">GET /api/services</code> - Danh sách service</div>
                 <div><code class="text-info">GET /api/status</code> - Trạng thái</div>
@@ -803,9 +1022,11 @@ if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     debug = os.environ.get('FLASK_DEBUG', 'False').lower() == 'true'
     print("=" * 50)
-    print("🚀 ZEFOY API SERVER v2.0")
+    print("🚀 ZEFOY API SERVER v2.1")
     print("=" * 50)
     print(f"📍 Port: {port}")
     print(f"👤 Admin: admin / zefoy2026")
+    print("=" * 50)
+    print("📌 Flow đúng: Login → Lấy services → Gửi service")
     print("=" * 50)
     app.run(host='0.0.0.0', port=port, debug=debug, threaded=True)
